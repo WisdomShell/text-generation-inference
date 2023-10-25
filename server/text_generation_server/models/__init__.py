@@ -51,6 +51,9 @@ try:
     from text_generation_server.models.flash_llama import (
         FlashLlama,
     )
+    from text_generation_server.models.flash_shell import (
+        FlashShell,
+    )
     from text_generation_server.models.flash_santacoder import (
         FlashSantacoderSharded,
     )
@@ -207,6 +210,25 @@ def get_model(
             )
         elif sharded:
             raise NotImplementedError(FLASH_ATT_ERROR_MESSAGE.format("Sharded Llama"))
+        else:
+            return CausalLM(
+                model_id,
+                revision,
+                quantize=quantize,
+                dtype=dtype,
+                trust_remote_code=trust_remote_code,
+            )
+    elif model_type in {"shell", "codeshell", "kclgpt"}:
+        if FLASH_ATTENTION:
+            return FlashShell(
+                model_id,
+                revision,
+                quantize=quantize,
+                dtype=dtype,
+                trust_remote_code=trust_remote_code,
+            )
+        elif sharded:
+            raise NotImplementedError(FLASH_ATT_ERROR_MESSAGE.format("Sharded Shell"))
         else:
             return CausalLM(
                 model_id,

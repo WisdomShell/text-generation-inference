@@ -151,7 +151,7 @@ For example, if you want to serve the gated Llama V2 model variants:
 or with Docker:
 
 ```shell
-model=meta-llama/Llama-2-7b-chat-hf
+model=WisdomShell/CodeShell-7B
 volume=$PWD/data # share a volume with the Docker container to avoid downloading weights every run
 token=<your cli READ token>
 
@@ -225,7 +225,7 @@ Then run:
 
 ```shell
 BUILD_EXTENSIONS=True make install # Install repository and HF/transformer fork with CUDA kernels
-make run-falcon-7b-instruct
+make run-codeshell
 ```
 
 **Note:** on some machines, you may also need the OpenSSL libraries and gcc. On Linux machines, run:
@@ -241,12 +241,12 @@ the kernels by using the `DISABLE_CUSTOM_KERNELS=True` environment variable.
 
 Be aware that the official Docker image has them enabled by default.
 
-## Run Falcon
+## Run CodeShell
 
 ### Run
 
 ```shell
-make run-falcon-7b-instruct
+make run-codeshell
 ```
 
 ### Quantization
@@ -254,7 +254,7 @@ make run-falcon-7b-instruct
 You can also quantize the weights with bitsandbytes to reduce the VRAM requirement:
 
 ```shell
-make run-falcon-7b-instruct-quantize
+make run-codeshell
 ```
 
 4bit quantization is available using the [NF4 and FP4 data types from bitsandbytes](https://arxiv.org/pdf/2305.14314.pdf). It can be enabled by providing `--quantize bitsandbytes-nf4` or `--quantize bitsandbytes-fp4` as a command line argument to `text-generation-launcher`.
