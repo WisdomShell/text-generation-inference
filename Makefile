@@ -51,5 +51,8 @@ run-falcon-7b-instruct-quantize:
 run-codeshell:
 	text-generation-launcher --model-id /shd/zzr/code_copilot/training/output_models/codeshellchat-special_codeshellchat-v2_copilot-randomtoken/checkpoint-1300 --port 3030 --max-total-tokens 5000 --max-input-length 4096 --num-shard 1
 
+run-llama2:
+	text-generation-launcher --model-id /shd/zzr/code_copilot/training/original_models/llama2-7b/ --port 3030 --max-total-tokens 5000 --max-input-length 4096 --num-shard 1
+
 clean:
 	rm -rf target aml

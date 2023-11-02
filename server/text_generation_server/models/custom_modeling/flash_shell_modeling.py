@@ -96,13 +96,62 @@ class ShellConfig(PretrainedConfig):
             **kwargs,
         )
 
-def load_attention(config, prefix, weights):
-    return TensorParallelColumnLinear.load_qkv(
-        config,
-        prefix=f"{prefix}.c_attn",
-        weights=weights,
-        bias=True,
-    )
+def load_attention(
+    config, prefix: str, weights, bias: bool, q_size, kv_size
+):
+    if config.quantize == "gptq":
+        NotImplementedError("Gptq loading with codeshell is not implemented")
+    else:
+        return _load_attention(
+            config, prefix, weights, bias, q_size, kv_size
+        )
+
+def _load_attention(
+    config, prefix: str, weights, bias: bool, q_size, kv_size
+):
+    slice_ = weights._get_slice(f"{prefix}.c_attn.weight")
+    world_size = weights.process_group.size()
+    rank = weights.process_group.rank()
+
+    assert q_size % world_size == 0
+    q_block_size = q_size // world_size
+    q_start = rank * q_block_size
+    q_stop = (rank + 1) * q_block_size
+    
+    assert kv_size % world_size == 0
+    kv_block_size = kv_size // world_size
+    offset = q_size
+    k_start = offset + rank * kv_block_size
+    k_stop = offset + (rank + 1) * kv_block_size
+    
+    offset = q_size + kv_size
+    v_start = offset + rank * kv_block_size
+    v_stop = offset + (rank + 1) * kv_block_size
+    
+    if config.transpose:
+        q_tensor = slice_[:, q_start:q_stop]
+        k_tensor = slice_[:, k_start:k_stop]
+        v_tensor = slice_[:, v_start:v_stop]
+    else:
+        q_tensor = slice_[q_start:q_stop]
+        k_tensor = slice_[k_start:k_stop]
+        v_tensor = slice_[v_start:v_stop]
+    
+    weight = torch.cat([q_tensor, k_tensor, v_tensor], dim=0)
+    if bias:
+        slice_ = weights._get_slice(f"{prefix}.c_attn.bias")
+        q_tensor = slice_[q_start:q_stop]
+        k_tensor = slice_[k_start:k_stop]
+        v_tensor = slice_[v_start:v_stop]
+        
+        bias = torch.cat([q_tensor, k_tensor, v_tensor], dim=0)
+    else:
+        bias = None
+
+    weight = weight.to(dtype=weights.dtype).to(device=weights.device)
+    if bias is not None:
+        bias = bias.to(dtype=weights.dtype).to(device=weights.device)
+    return TensorParallelColumnLinear(get_linear(weight, bias, config.quantize))
 
 def load_row(config, prefix: str, weights, bias: bool):
     if config.transpose:
@@ -151,7 +200,10 @@ class FlashShellAttention(torch.nn.Module):
             config.num_key_value_heads // weights.process_group.size()
         )
 
-        self.query_key_value = load_attention(config, prefix, weights)
+        q_size = config.num_attention_heads * self.head_size
+        kv_size = config.num_key_value_heads * self.head_size
+        self.query_key_value = load_attention(config, prefix, weights, 
+                                              True, q_size, kv_size)
 
         self.o_proj = load_row(
             config, prefix=f"{prefix}.c_proj", weights=weights, bias=True
@@ -173,9 +225,7 @@ class FlashShellAttention(torch.nn.Module):
         input_lengths,
         max_s,
     ):
-        print("hidden_states", hidden_states.size())
         qkv = self.query_key_value(hidden_states)
-        print("qkv", qkv.size(), self.head_size * self.num_heads, 2 * self.head_size * self.num_key_value_heads)
         query, kv = qkv.split(
             [
                 self.head_size * self.num_heads,
@@ -328,7 +378,7 @@ class FlashShellModel(torch.nn.Module):
         self.tp_rank = process_group.rank()
         self.tp_world_size = process_group.size()
         self.embed_tokens = TensorParallelEmbedding(
-            prefix="transformer.wte", weights=weights, reduce=False,
+            prefix="transformer.wte", weights=weights, reduce=True,
         )
         self.layers = nn.ModuleList(
             [

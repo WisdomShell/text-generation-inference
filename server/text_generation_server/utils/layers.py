@@ -425,8 +425,7 @@ class TensorParallelColumnLinear(SuperLayer):
         """Specific method when the QKV was joined after the fact"""
         weight = weights.get_weights_col_packed_qkv(prefix, quantize=config.quantize)
         if bias:
-            bias = weights.get_tensor(f"{prefix}.bias")
-            # raise NotImplementedError("packed_qkv only implemented for baichuan")
+            raise NotImplementedError("packed_qkv only implemented for baichuan")
         else:
             bias = None
         linear = get_linear(weight, bias, config.quantize)
