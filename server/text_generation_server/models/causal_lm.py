@@ -1,6 +1,5 @@
-from text_generation_server.utils.tokens import batch_top_tokens
 import torch
-import inspect
+import time
 
 from dataclasses import dataclass
 from opentelemetry import trace
@@ -8,12 +7,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenize
 from typing import Optional, Tuple, List, Type, Dict
 
 from text_generation_server.models import Model
+from text_generation_server.utils.tokens import batch_top_tokens
 from text_generation_server.models.types import (
     Batch,
-    PrefillTokens,
+    Tokens,
     Generation,
     GeneratedText,
-    TopTokens,
 )
 from text_generation_server.pb import generate_pb2
 from text_generation_server.utils import NextTokenChooser, StoppingCriteria, Sampling
@@ -511,7 +510,11 @@ class CausalLM(Model):
             load_in_8bit=quantize == "bitsandbytes",
             trust_remote_code=trust_remote_code,
         )
-        if torch.cuda.is_available() and torch.cuda.device_count() == 1:
+        if (
+            torch.cuda.is_available()
+            and torch.cuda.device_count() == 1
+            and quantize != "bitsandbytes"
+        ):
             model = model.cuda()
 
         if tokenizer.pad_token_id is None:
@@ -561,7 +564,8 @@ class CausalLM(Model):
     @tracer.start_as_current_span("generate_token")
     def generate_token(
         self, batch: CausalLMBatch
-    ) -> Tuple[List[Generation], Optional[CausalLMBatch]]:
+    ) -> Tuple[List[Generation], Optional[CausalLMBatch], Tuple[int, int]]:
+        start = time.time_ns()
         # slice the attention mask to the correct shape
         attention_mask = batch.attention_mask[:, : -batch.padding_right_offset]
 
@@ -576,11 +580,16 @@ class CausalLM(Model):
         generations: List[Generation] = []
         stopped = True
 
+        # Speculation is not active for causal
+        accepted_ids = torch.ones_like(batch.input_ids)[:, 0]
         batch_top_token_ids, batch_top_token_logprobs = batch_top_tokens(
             batch.top_n_tokens,
             batch.top_n_tokens_tensor,
             torch.log_softmax(logits[:, -1], -1),
+            accepted_ids,
         )
+
+        start_decode = time.time_ns()
 
         # Zipped iterator
         iterator = zip(
@@ -676,37 +685,46 @@ class CausalLM(Model):
                         clean_up_tokenization_spaces=False,
                         skip_special_tokens=False,
                     )
-                    prefill_tokens = PrefillTokens(
-                        prefill_token_ids, prefill_logprobs, prefill_texts
+                    prefill_tokens = Tokens(
+                        prefill_token_ids,
+                        prefill_logprobs,
+                        prefill_texts,
+                        is_special=[],
                     )
                 else:
                     prefill_tokens = None
 
                 if top_n_tokens > 0:
-                    toptoken_texts = self.tokenizer.batch_decode(
-                        top_token_ids,
-                        clean_up_tokenization_spaces=False,
-                        skip_special_tokens=False,
-                    )
-                    special_toptokens = [
-                        token_id in self.all_special_ids for token_id in top_token_ids
-                    ]
-                    top_tokens = TopTokens(
-                        top_token_ids,
-                        top_token_logprobs,
-                        toptoken_texts,
-                        special_toptokens,
-                    )
+                    all_top_tokens = []
+                    for (top_token_ids, top_token_logprobs) in zip(top_token_ids, top_token_logprobs):
+                        toptoken_texts = self.tokenizer.batch_decode(
+                            top_token_ids,
+                            clean_up_tokenization_spaces=False,
+                            skip_special_tokens=False,
+                        )
+                        special_toptokens = [
+                            token_id in self.all_special_ids for token_id in top_token_ids
+                        ]
+                        top_tokens = Tokens(
+                            top_token_ids,
+                            top_token_logprobs,
+                            toptoken_texts,
+                            special_toptokens,
+                        )
+                        all_top_tokens.append(top_tokens)
+                    top_tokens = all_top_tokens
                 else:
                     top_tokens = None
 
                 generation = Generation(
                     request.id,
                     prefill_tokens,
-                    next_token_id_squeezed,
-                    next_token_logprob,
-                    next_token_text,
-                    next_token_id_squeezed.item() in self.all_special_ids,
+                    Tokens(
+                        [next_token_id_squeezed],
+                        [next_token_logprob],
+                        [next_token_text],
+                        [next_token_id_squeezed.item() in self.all_special_ids],
+                    ),
                     generated_text,
                     top_tokens,
                 )
@@ -723,7 +741,9 @@ class CausalLM(Model):
 
         # We finished all generations in the batch; there is no next batch
         if stopped:
-            return generations, None
+            forward_ns = start_decode - start
+            decode_ns = time.time_ns() - start_decode
+            return generations, None, (forward_ns, decode_ns)
 
         # Slice unused values from prefill
         batch.input_ids = batch.input_ids[:, :1]
@@ -739,4 +759,6 @@ class CausalLM(Model):
         # Update past key values
         batch.past_key_values = past
 
-        return generations, batch
+        forward_ns = start_decode - start
+        decode_ns = time.time_ns() - start_decode
+        return generations, batch, (forward_ns, decode_ns)

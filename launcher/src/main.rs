@@ -4,7 +4,7 @@ use nix::unistd::Pid;
 use serde::Deserialize;
 use std::env;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Lines, Read};
+use std::io::{BufRead, BufReader, Lines};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -21,16 +21,16 @@ mod env_runtime;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Quantization {
-    /// 4 bit quantization. Requires a specific GTPQ quantized model:
+    /// 4 bit quantization. Requires a specific AWQ quantized model:
     ///   https://hf.co/models?search=awq.
-    /// Should replace GPTQ models whereever possible because of the better latency
+    /// Should replace GPTQ models wherever possible because of the better latency
     Awq,
     /// 8 bit quantization, doesn't require specific model.
     /// Should be a drop-in replacement to bitsandbytes with much better performance.
     /// Kernels are from https://github.com/NetEase-FuXi/EETQ.git
     Eetq,
     /// 4 bit quantization. Requires a specific GTPQ quantized model: https://hf.co/models?search=gptq.
-    /// text-generation-inference will use exllama (faster) kernels whereever possible, and use
+    /// text-generation-inference will use exllama (faster) kernels wherever possible, and use
     /// triton kernel (wider support) when it's not.
     /// AWQ has faster kernels.
     Gptq,
@@ -53,6 +53,8 @@ impl std::fmt::Display for Quantization {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // To keep in track with `server`.
         match self {
+            #[allow(deprecated)]
+            // Use `eetq` instead, which provides better latencies overall and is drop-in in most cases
             Quantization::Bitsandbytes => {
                 write!(f, "bitsandbytes")
             }
@@ -154,6 +156,13 @@ struct Args {
     /// Whether you want the model to be quantized.
     #[clap(long, env, value_enum)]
     quantize: Option<Quantization>,
+
+    /// The number of input_ids to speculate on
+    /// If using a medusa model, the heads will be picked up automatically
+    /// Other wise, it will use n-gram speculation which is relatively free
+    /// in terms of compute, but the speedup heavily depends on the task.
+    #[clap(long, env)]
+    speculate: Option<usize>,
 
     /// The dtype to be forced upon the model. This option cannot be used with `--quantize`.
     #[clap(long, env, value_enum)]
@@ -359,6 +368,11 @@ struct Args {
     #[clap(long, env)]
     ngrok_edge: Option<String>,
 
+    /// The path to the tokenizer config file. This path is used to load the tokenizer configuration which may
+    /// include a `chat_template`. If not provided, the default config will be used from the model hub.
+    #[clap(long, env)]
+    tokenizer_config_path: Option<String>,
+
     /// Display a lot of information about your runtime environment
     #[clap(long, short, action)]
     env: bool,
@@ -375,6 +389,7 @@ fn shard_manager(
     model_id: String,
     revision: Option<String>,
     quantize: Option<Quantization>,
+    speculate: Option<usize>,
     dtype: Option<Dtype>,
     trust_remote_code: bool,
     uds_path: String,
@@ -432,6 +447,11 @@ fn shard_manager(
         shard_args.push(quantize.to_string())
     }
 
+    if let Some(speculate) = speculate {
+        shard_args.push("--speculate".to_string());
+        shard_args.push(speculate.to_string())
+    }
+
     if let Some(dtype) = dtype {
         shard_args.push("--dtype".to_string());
         shard_args.push(dtype.to_string())
@@ -473,6 +493,9 @@ fn shard_manager(
 
     // Safetensors load fast
     envs.push(("SAFETENSORS_FAST_GPU".into(), "1".into()));
+
+    // Disable progress bar
+    envs.push(("HF_HUB_DISABLE_PROGRESS_BARS".into(), "1".into()));
 
     // Enable hf transfer for insane download speeds
     let enable_hf_transfer = env::var("HF_HUB_ENABLE_HF_TRANSFER").unwrap_or("1".to_string());
@@ -558,6 +581,13 @@ fn shard_manager(
     thread::spawn(move || {
         log_lines(shard_stdout_reader.lines());
     });
+    // We read stderr in another thread as it seems that lines() can block in some cases
+    let (err_sender, err_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in shard_stderr_reader.lines().flatten() {
+            err_sender.send(line).unwrap_or(());
+        }
+    });
 
     let mut ready = false;
     let start_time = Instant::now();
@@ -565,13 +595,6 @@ fn shard_manager(
     loop {
         // Process exited
         if let Some(exit_status) = p.try_wait().unwrap() {
-            // We read stderr in another thread as it seems that lines() can block in some cases
-            let (err_sender, err_receiver) = mpsc::channel();
-            thread::spawn(move || {
-                for line in shard_stderr_reader.lines().flatten() {
-                    err_sender.send(line).unwrap_or(());
-                }
-            });
             let mut err = String::new();
             while let Ok(line) = err_receiver.recv_timeout(Duration::from_millis(10)) {
                 err = err + "\n" + &line;
@@ -767,6 +790,9 @@ fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), L
     // Copy current process env
     let mut envs: Vec<(OsString, OsString)> = env::vars_os().collect();
 
+    // Disable progress bar
+    envs.push(("HF_HUB_DISABLE_PROGRESS_BARS".into(), "1".into()));
+
     // If huggingface_hub_cache is set, pass it to the download process
     // Useful when running inside a docker container
     if let Some(ref huggingface_hub_cache) = args.huggingface_hub_cache {
@@ -817,12 +843,20 @@ fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), L
         }
     };
 
-    // Redirect STDOUT to the console
-    let download_stdout = download_process.stdout.take().unwrap();
-    let stdout = BufReader::new(download_stdout);
+    let download_stdout = BufReader::new(download_process.stdout.take().unwrap());
 
     thread::spawn(move || {
-        log_lines(stdout.lines());
+        log_lines(download_stdout.lines());
+    });
+
+    let download_stderr = BufReader::new(download_process.stderr.take().unwrap());
+
+    // We read stderr in another thread as it seems that lines() can block in some cases
+    let (err_sender, err_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in download_stderr.lines().flatten() {
+            err_sender.send(line).unwrap_or(());
+        }
     });
 
     loop {
@@ -833,12 +867,10 @@ fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), L
             }
 
             let mut err = String::new();
-            download_process
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut err)
-                .unwrap();
+            while let Ok(line) = err_receiver.recv_timeout(Duration::from_millis(10)) {
+                err = err + "\n" + &line;
+            }
+
             if let Some(signal) = status.signal() {
                 tracing::error!(
                     "Download process was signaled to shutdown with signal {signal}: {err}"
@@ -882,6 +914,7 @@ fn spawn_shards(
         let shutdown_sender = shutdown_sender.clone();
         let otlp_endpoint = args.otlp_endpoint.clone();
         let quantize = args.quantize;
+        let speculate = args.speculate;
         let dtype = args.dtype;
         let trust_remote_code = args.trust_remote_code;
         let master_port = args.master_port;
@@ -896,6 +929,7 @@ fn spawn_shards(
                 model_id,
                 revision,
                 quantize,
+                speculate,
                 dtype,
                 trust_remote_code,
                 uds_path,
@@ -986,6 +1020,12 @@ fn spawn_webserver(
         "--tokenizer-name".to_string(),
         args.model_id,
     ];
+
+    // Tokenizer config path
+    if let Some(ref tokenizer_config_path) = args.tokenizer_config_path {
+        router_args.push("--tokenizer-config-path".to_string());
+        router_args.push(tokenizer_config_path.to_string());
+    }
 
     // Model optional max batch total tokens
     if let Some(max_batch_total_tokens) = args.max_batch_total_tokens {

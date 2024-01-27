@@ -6,6 +6,7 @@ import torch
 from loguru import logger
 from huggingface_hub import hf_hub_download
 import json
+from text_generation_server.utils.log import log_once
 
 
 class Weights:
@@ -16,7 +17,7 @@ class Weights:
         dtype,
         process_group,
         aliases: Optional[Dict[str, List[str]]] = None,
-        prefix: Optional[str] = None
+        prefix: Optional[str] = None,
     ):
         routing = {}
         for filename in filenames:
@@ -91,7 +92,7 @@ class Weights:
         rank = self.process_group.rank()
 
         size = slice_.get_shape()[dim]
-        block_size = size // world_size
+        block_size = (size + world_size - 1) // world_size
         start = rank * block_size
         stop = (rank + 1) * block_size
 
@@ -161,7 +162,7 @@ class Weights:
             else:
                 g_idx = None
 
-            bits, groupsize = self._get_gptq_params()
+            bits, groupsize, _ = self._get_gptq_params()
             weight = (qweight, qzeros, scales, g_idx, bits, groupsize, False)
         else:
             slice_ = self._get_slice(f"{prefix}.weight")
@@ -211,9 +212,12 @@ class Weights:
             else:
                 g_idx = None
 
-            bits, groupsize = self._get_gptq_params()
+            bits, groupsize, desc_act = self._get_gptq_params()
             from text_generation_server.utils.layers import HAS_EXLLAMA
-            use_exllama = bits==4  and HAS_EXLLAMA and quantize == "gptq"
+
+            use_exllama = (
+                bits == 4 and HAS_EXLLAMA and quantize == "gptq" and not desc_act
+            )
             weight = (qweight, qzeros, scales, g_idx, bits, groupsize, use_exllama)
         else:
             w = [self.get_sharded(f"{p}.weight", dim=0) for p in prefixes]
@@ -239,9 +243,13 @@ class Weights:
     def get_multi_weights_row(self, prefix: str, quantize: str):
         if quantize == "gptq":
             use_exllama = True
-            bits, groupsize = self._get_gptq_params()
+            bits, groupsize, desc_act = self._get_gptq_params()
 
             if bits != 4:
+                use_exllama = False
+
+            if desc_act:
+                log_once(logger.warning, "Disabling exllama because desc_act=True")
                 use_exllama = False
 
             if self.process_group.size() > 1:
@@ -273,38 +281,29 @@ class Weights:
             if use_exllama:
                 if not HAS_EXLLAMA:
                     if CAN_EXLLAMA:
-                        logger.warning(
-                            "Exllama GPTQ cuda kernels (which are faster) could have been used, but are not currently installed, try using BUILD_EXTENSIONS=True"
+                        log_once(
+                            logger.warning,
+                            "Exllama GPTQ cuda kernels (which are faster) could have been used, but are not currently installed, try using BUILD_EXTENSIONS=True",
                         )
                     use_exllama = False
                 else:
-                    logger.info("Using exllama kernels")
+                    log_once(logger.info, f"Using exllama kernels v{HAS_EXLLAMA}")
 
-            if use_exllama:
-                if groupsize >= 0:
-                    # Exllama reorders the weights in advance and the activations on the fly, thus
-                    # the scales and zero-points do not need to be reordered.
-                    qzeros = self.get_sharded(f"{prefix}.qzeros", dim=0)
-                    scales = self.get_sharded(f"{prefix}.scales", dim=0)
-                else:
-                    qzeros = self.get_tensor(f"{prefix}.qzeros")
-                    scales = self.get_tensor(f"{prefix}.scales")
+            g_idx = self.get_sharded(f"{prefix}.g_idx", dim=0)
 
-                # For tp > 1, at this point we know we do not use act-order
-                if self.process_group.size() == 1:
-                    g_idx = self.get_tensor(f"{prefix}.g_idx")
-                else:
-                    g_idx = None
+            if use_exllama and groupsize != -1:
+                qzeros = self.get_sharded(f"{prefix}.qzeros", dim=0)
+                scales = self.get_sharded(f"{prefix}.scales", dim=0)
             else:
-                # The triton kernel reorders the scales/zero points instead of the weight/activation.
-                # Thus, each rank needs the full qzeros/scales.
                 qzeros = self.get_tensor(f"{prefix}.qzeros")
                 scales = self.get_tensor(f"{prefix}.scales")
-                g_idx = self.get_sharded(f"{prefix}.g_idx", dim=0)
+
+            if use_exllama:
+                g_idx = g_idx - g_idx[0]
 
             weight = (qweight, qzeros, scales, g_idx, bits, groupsize, use_exllama)
         elif quantize == "awq":
-            bits, groupsize = self._get_gptq_params()
+            bits, groupsize, _ = self._get_gptq_params()
 
             try:
                 qweight = self.get_sharded(f"{prefix}.qweight", dim=0)
@@ -323,51 +322,62 @@ class Weights:
             weight = self.get_sharded(f"{prefix}.weight", dim=1)
         return weight
 
-    def _get_gptq_params(self) -> Tuple[int, int]:
+    def _get_gptq_params(self) -> Tuple[int, int, int]:
         try:
             bits = self.get_tensor("gptq_bits").item()
             groupsize = self.get_tensor("gptq_groupsize").item()
+            desc_act = False
         except (SafetensorError, RuntimeError) as e:
             try:
                 bits = self.gptq_bits
                 groupsize = self.gptq_groupsize
+                desc_act = getattr(self, "gptq_desc_act", False)
             except Exception:
                 raise e
 
-        return bits, groupsize
+        return bits, groupsize, desc_act
 
-    def _set_gptq_params(self, model_id):
+    def _set_gptq_params(self, model_id, revision):
         filename = "config.json"
         try:
             if os.path.exists(os.path.join(model_id, filename)):
                 filename = os.path.join(model_id, filename)
             else:
-                filename = hf_hub_download(model_id, filename=filename)
+                filename = hf_hub_download(
+                    model_id, filename=filename, revision=revision
+                )
             with open(filename, "r") as f:
                 data = json.load(f)
             self.gptq_bits = data["quantization_config"]["bits"]
             self.gptq_groupsize = data["quantization_config"]["group_size"]
+            self.gptq_desc_act = data["quantization_config"]["desc_act"]
         except Exception:
             filename = "quantize_config.json"
             try:
                 if os.path.exists(os.path.join(model_id, filename)):
                     filename = os.path.join(model_id, filename)
                 else:
-                    filename = hf_hub_download(model_id, filename=filename)
+                    filename = hf_hub_download(
+                        model_id, filename=filename, revision=revision
+                    )
                 with open(filename, "r") as f:
                     data = json.load(f)
                 self.gptq_bits = data["bits"]
                 self.gptq_groupsize = data["group_size"]
+                self.gptq_desc_act = data["desc_act"]
             except Exception:
                 filename = "quant_config.json"
                 try:
                     if os.path.exists(os.path.join(model_id, filename)):
                         filename = os.path.join(model_id, filename)
                     else:
-                        filename = hf_hub_download(model_id, filename=filename)
+                        filename = hf_hub_download(
+                            model_id, filename=filename, revision=revision
+                        )
                     with open(filename, "r") as f:
                         data = json.load(f)
                     self.gptq_bits = data["w_bit"]
                     self.gptq_groupsize = data["q_group_size"]
+                    self.gptq_desc_act = data["desc_act"]
                 except Exception:
                     pass

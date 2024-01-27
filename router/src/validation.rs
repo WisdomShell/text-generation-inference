@@ -6,6 +6,7 @@ use text_generation_client::{NextTokenChooserParameters, StoppingCriteriaParamet
 use thiserror::Error;
 use tokenizers::tokenizer::Tokenizer;
 use tokenizers::TruncationDirection;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::{instrument, Span};
 
@@ -19,7 +20,7 @@ pub struct Validation {
     max_input_length: usize,
     max_total_tokens: usize,
     /// Channel to communicate with the background tokenization task
-    sender: Option<flume::Sender<TokenizerRequest>>,
+    sender: Option<mpsc::UnboundedSender<TokenizerRequest>>,
 }
 
 impl Validation {
@@ -34,19 +35,25 @@ impl Validation {
     ) -> Self {
         // If we have a fast tokenizer
         let sender = if let Some(tokenizer) = tokenizer {
-            // Create channel
-            let (validation_sender, validation_receiver) = flume::unbounded();
+            // Create round robin channel
+            let (validation_sender, validation_round_robin_receiver) = mpsc::unbounded_channel();
+            let mut senders = Vec::with_capacity(workers);
 
             // Create workers
             for _ in 0..workers {
                 let tokenizer_clone = tokenizer.clone();
-                let receiver_clone = validation_receiver.clone();
+                let (tokenizer_sender, tokenizer_receiver) = mpsc::unbounded_channel();
+                senders.push(tokenizer_sender);
 
                 // Spawn worker
                 tokio::task::spawn_blocking(move || {
-                    tokenizer_worker(tokenizer_clone, receiver_clone)
+                    tokenizer_worker(tokenizer_clone, tokenizer_receiver)
                 });
             }
+
+            // Create tokenization round robin task
+            tokio::spawn(round_robin_task(validation_round_robin_receiver, senders));
+
             Some(validation_sender)
         } else {
             None
@@ -62,13 +69,12 @@ impl Validation {
         }
     }
 
-    #[instrument(skip_all)]
-    async fn validate_input(
+    #[instrument(skip(self, inputs))]
+    pub async fn tokenize(
         &self,
         inputs: String,
         truncate: Option<usize>,
-        max_new_tokens: Option<u32>,
-    ) -> Result<(String, usize, u32), ValidationError> {
+    ) -> Result<Option<(tokenizers::Encoding, String)>, ValidationError> {
         // If we have a fast tokenizer
         if let Some(sender) = &self.sender {
             // Create response channel
@@ -81,7 +87,24 @@ impl Validation {
 
             // Await on response channel
             // Unwrap is safe here
-            let (inputs, input_length) = response_receiver.await.unwrap()?;
+            let encoding = response_receiver.await.unwrap()?;
+            Ok(Some(encoding))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[instrument(skip(self, inputs))]
+    async fn validate_input(
+        &self,
+        inputs: String,
+        truncate: Option<usize>,
+        max_new_tokens: Option<u32>,
+    ) -> Result<(String, usize, u32), ValidationError> {
+        // If we have a fast tokenizer
+        if let Some((encoding, inputs)) = self.tokenize(inputs.clone(), truncate).await? {
+            // Create response channel
+            let input_length = encoding.len();
 
             // Get total tokens
             let max_new_tokens: u32 = if let Some(max_new_tokens) = max_new_tokens {
@@ -116,12 +139,14 @@ impl Validation {
             // In this case, we don't know the real length in tokens of the inputs
             // However, the inputs will be truncated by the python servers
             // We make sure that truncate + max_new_tokens <= self.max_total_tokens
-            let input_length = truncate.unwrap_or(self.max_input_length);
             let max_new_tokens: u32 = if let Some(max_new_tokens) = max_new_tokens {
                 max_new_tokens
+            } else if let Some(truncate) = truncate {
+                self.max_total_tokens.saturating_sub(truncate) as u32
             } else {
-                self.max_total_tokens.saturating_sub(input_length) as u32
+                return Err(ValidationError::UnsetMaxNewTokens);
             };
+            let input_length = truncate.unwrap_or(self.max_input_length);
 
             // Validate MaxNewTokens
             if (input_length as u32 + max_new_tokens) > self.max_total_tokens as u32 {
@@ -305,10 +330,25 @@ impl Validation {
     }
 }
 
+/// Round robin tokenization task
+async fn round_robin_task(
+    mut receiver: mpsc::UnboundedReceiver<TokenizerRequest>,
+    senders: Vec<mpsc::UnboundedSender<TokenizerRequest>>,
+) {
+    loop {
+        for sender in &senders {
+            match receiver.recv().await {
+                None => return,
+                Some(request) => sender.send(request).unwrap(),
+            };
+        }
+    }
+}
+
 /// Start tokenization workers
-fn tokenizer_worker(tokenizer: Tokenizer, receiver: flume::Receiver<TokenizerRequest>) {
+fn tokenizer_worker(tokenizer: Tokenizer, mut receiver: mpsc::UnboundedReceiver<TokenizerRequest>) {
     // Loop over requests
-    while let Ok(((inputs, truncate), response_tx, parent_span)) = receiver.recv() {
+    while let Some(((inputs, truncate), response_tx, parent_span)) = receiver.blocking_recv() {
         parent_span.in_scope(|| {
             response_tx
                 .send(prepare_input(inputs, truncate, &tokenizer))
@@ -319,40 +359,35 @@ fn tokenizer_worker(tokenizer: Tokenizer, receiver: flume::Receiver<TokenizerReq
 
 /// Get input length and optionally truncate it
 fn prepare_input(
-    inputs: String,
+    mut inputs: String,
     truncate: Option<usize>,
     tokenizer: &Tokenizer,
-) -> Result<(String, usize), ValidationError> {
+) -> Result<(tokenizers::Encoding, String), ValidationError> {
     // Get the number of tokens in the input
     let mut encoding = tokenizer
         .encode(inputs.clone(), true)
         .map_err(|err| ValidationError::Tokenizer(err.to_string()))?;
 
     // Optionally truncate
-    let (inputs, input_length) = match truncate {
-        // Truncate is some and < encoding length
-        Some(truncate) if truncate < encoding.len() => {
-            // truncate encoding and decode new inputs
+    if let Some(truncate) = truncate {
+        if truncate < encoding.len() {
             encoding.truncate(truncate, 0, TruncationDirection::Left);
-            let inputs = tokenizer
+            inputs = tokenizer
                 .decode(encoding.get_ids(), false)
                 .map_err(|err| ValidationError::Tokenizer(err.to_string()))?;
-            (inputs, encoding.len())
         }
-        // Nothing to do
-        _ => (inputs, encoding.len()),
-    };
+    }
 
-    Ok((inputs, input_length))
+    Ok((encoding, inputs))
 }
 
 type TokenizerRequest = (
     (String, Option<usize>),
-    oneshot::Sender<Result<(String, usize), ValidationError>>,
+    oneshot::Sender<Result<(tokenizers::Encoding, String), ValidationError>>,
     Span,
 );
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ValidGenerateRequest {
     pub inputs: String,
     pub input_length: u32,
@@ -393,6 +428,8 @@ pub enum ValidationError {
     Truncate(usize, usize),
     #[error("`typical_p` must be > 0.0 and < 1.0")]
     TypicalP,
+    #[error("one of `max_new_tokens` or `truncate` must be set if a fast tokenizer is not in use")]
+    UnsetMaxNewTokens,
     #[error("`max_new_tokens` must be strictly positive")]
     NegativeMaxNewTokens,
     #[error("`max_new_tokens` must be <= {0}. Given: {1}")]
@@ -514,7 +551,7 @@ mod tests {
         let max_stop_sequence = 3;
         let max_top_n_tokens = 4;
         let max_input_length = 5;
-        let max_total_tokens = 6;
+        let max_total_tokens = 106;
         let workers = 1;
         let validation = Validation::new(
             workers,
@@ -530,6 +567,7 @@ mod tests {
                 inputs: "Hello".to_string(),
                 parameters: GenerateParameters {
                     top_p: Some(1.0),
+                    max_new_tokens: Some(5),
                     ..default_parameters()
                 },
             })
@@ -544,6 +582,7 @@ mod tests {
                 inputs: "Hello".to_string(),
                 parameters: GenerateParameters {
                     top_p: Some(0.99),
+                    max_new_tokens: Some(5),
                     ..default_parameters()
                 },
             })
@@ -558,6 +597,7 @@ mod tests {
                 inputs: "Hello".to_string(),
                 parameters: GenerateParameters {
                     top_p: None,
+                    max_new_tokens: Some(5),
                     ..default_parameters()
                 },
             })
@@ -574,7 +614,7 @@ mod tests {
         let max_stop_sequences = 3;
         let max_top_n_tokens = 4;
         let max_input_length = 5;
-        let max_total_tokens = 6;
+        let max_total_tokens = 106;
         let workers = 1;
         let validation = Validation::new(
             workers,
@@ -590,6 +630,7 @@ mod tests {
                 inputs: "Hello".to_string(),
                 parameters: GenerateParameters {
                     top_n_tokens: Some(5),
+                    max_new_tokens: Some(5),
                     ..default_parameters()
                 },
             })
@@ -604,6 +645,7 @@ mod tests {
                 inputs: "Hello".to_string(),
                 parameters: GenerateParameters {
                     top_n_tokens: Some(4),
+                    max_new_tokens: Some(5),
                     ..default_parameters()
                 },
             })
@@ -615,6 +657,7 @@ mod tests {
                 inputs: "Hello".to_string(),
                 parameters: GenerateParameters {
                     top_n_tokens: Some(0),
+                    max_new_tokens: Some(5),
                     ..default_parameters()
                 },
             })
@@ -626,6 +669,7 @@ mod tests {
                 inputs: "Hello".to_string(),
                 parameters: GenerateParameters {
                     top_n_tokens: None,
+                    max_new_tokens: Some(5),
                     ..default_parameters()
                 },
             })
