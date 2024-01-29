@@ -15,6 +15,7 @@
 # curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 # source "$HOME/.cargo/env"
 # cd router && cargo install --path .
+make clean
 # BUILD_EXTENSIONS=True make install-server
 make run-llama2
 # make run-codeshell

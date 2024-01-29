@@ -49,10 +49,10 @@ run-falcon-7b-instruct-quantize:
 	text-generation-launcher --model-id tiiuae/falcon-7b-instruct --quantize bitsandbytes --port 8080
 
 run-codeshell:
-	text-generation-launcher --model-id /models/codeshell-7b/ --port 9123 --num-shard 1 --rope-scaling dynamic --rope-factor 8 --max-input-length 31000 --max-total-tokens 32768 --max-batch-prefill-tokens 31000 
+	text-generation-launcher --model-id /models/codeshell-7b/ --port 80 --num-shard 1 --rope-scaling dynamic --rope-factor 8 --max-input-length 31000 --max-total-tokens 32768 --max-batch-prefill-tokens 31000 
 
 run-llama2:
-	text-generation-launcher --model-id /models/codellama-7b/ --port 9123 --num-shard 1 --rope-scaling dynamic --rope-factor 8 --max-input-length 31000 --max-total-tokens 32768 --max-batch-prefill-tokens 31000 
+	text-generation-launcher --model-id /models/codellama-7b/ --port 80 --num-shard 1 --rope-scaling dynamic --rope-factor 8 --max-input-length 31000 --max-total-tokens 32768 --max-batch-prefill-tokens 31000 
 
 clean:
 	rm -rf target aml
