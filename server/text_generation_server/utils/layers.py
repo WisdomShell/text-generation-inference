@@ -12,14 +12,14 @@ HAS_BITS_AND_BYTES = True
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Int8Params, Params4bit
-
 except ImportError:
     HAS_BITS_AND_BYTES = False
 
 from accelerate import init_empty_weights
 
 from text_generation_server.utils.gptq.quant_linear import QuantLinear
-
+from text_generation_server.utils.import_utils import IS_CUDA_SYSTEM, IS_ROCM_SYSTEM
+from text_generation_server.utils.log import log_once
 
 HAS_AWQ = True
 try:
@@ -31,19 +31,40 @@ try:
     major, _minor = torch.cuda.get_device_capability()
 except Exception:
     major = 1
+
 HAS_EXLLAMA = False
-CAN_EXLLAMA = major >= 8
+CAN_EXLLAMA = major >= 8 or IS_ROCM_SYSTEM
+V2 = os.getenv("EXLLAMA_VERSION", "2") == "2"
+# if V2 and int(os.getenv("WORLD_SIZE", "1")) > 1:
+#     V2 = False
+#     log_once(
+#         logger.warning,
+#         "Disabling exllama v2 and using v1 instead because there are issues when sharding",
+#     )
+
 if os.getenv("DISABLE_EXLLAMA") == "True":
     HAS_EXLLAMA = False
 elif CAN_EXLLAMA:
     try:
-        from text_generation_server.utils.gptq.exllama import Ex4bitLinear
+        if V2:
+            from text_generation_server.utils.gptq.exllamav2 import (
+                QuantLinear as ExllamaQuantLinear,
+                create_exllama_buffers,
+                set_device,
+            )
 
-        HAS_EXLLAMA = True
+            HAS_EXLLAMA = "2"
+        else:
+            from text_generation_server.utils.gptq.exllama import (
+                Ex4bitLinear as ExllamaQuantLinear,
+                create_exllama_buffers,
+                set_device,
+            )
+
+            HAS_EXLLAMA = "1"
+
     except ImportError:
         pass
-
-from typing import Optional
 
 HAS_EETQ = False
 try:
@@ -155,10 +176,7 @@ class EETQLinear(nn.Module):
         device = weight.device
         weight = torch.t(weight).contiguous().cpu()
         weight, scale = quant_weights(weight, torch.int8, False)
-        if bias:
-            bias = weights.get_tensor(f"{prefix}.bias")
-        else:
-            bias = None
+
         self.weight = weight.cuda(device)
         self.scale = scale.cuda(device)
         self.bias = bias.cuda(device) if bias is not None else None
@@ -311,7 +329,9 @@ def get_linear(weight, bias, quantize):
             )
 
         if use_exllama:
-            linear = Ex4bitLinear(qweight, qzeros, scales, g_idx, bias, bits, groupsize)
+            linear = ExllamaQuantLinear(
+                qweight, qzeros, scales, g_idx, bias, bits, groupsize
+            )
         else:
             linear = QuantLinear(
                 qweight,
@@ -469,9 +489,9 @@ class TensorParallelRowLinear(SuperLayer):
             process_group=weights.process_group,
         )
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor, reduce: bool = True) -> torch.Tensor:
         out = super().forward(input)
-        if self.process_group.size() > 1:
+        if self.process_group.size() > 1 and reduce:
             torch.distributed.all_reduce(out, group=self.process_group)
         return out
 
@@ -487,10 +507,12 @@ class TensorParallelEmbedding(nn.Module):
         world_size = process_group.size()
         rank = process_group.rank()
 
-        block_size = num_embeddings // world_size
+        block_size = (num_embeddings + world_size - 1) // world_size
         self.min_id = rank * block_size
         self.max_id = min(num_embeddings, (rank + 1) * block_size)
-        self.null_idx = block_size
+        self.null_idx = weight.shape[
+            0
+        ]  # Usually block_size, might be less in non even vocab_size.
         self.process_group = weights.process_group
         self.reduce = reduce
 
@@ -512,11 +534,16 @@ class TensorParallelEmbedding(nn.Module):
 
 
 try:
-    import dropout_layer_norm
+    if IS_CUDA_SYSTEM:
+        import dropout_layer_norm
+    elif IS_ROCM_SYSTEM:
+        from vllm import layernorm_ops
+    else:
+        dropout_layer_norm = None
 
     class FastLayerNorm(nn.LayerNorm):
         def forward(self, hidden_states, residual=None):
-            if hidden_states.shape[-1] > 8192:
+            if hidden_states.shape[-1] > 8192 or IS_ROCM_SYSTEM:
                 if residual is not None:
                     hidden_states += residual
                 residual = hidden_states
@@ -549,13 +576,90 @@ try:
 
                 return normed_hidden_states, residual
 
+    class FastRMSNorm(nn.Module):
+        def __init__(self, weight: torch.Tensor, eps: float):
+            super().__init__()
+
+            self.weight = nn.Parameter(weight)
+            self.variance_epsilon = eps
+
+        @classmethod
+        def load(cls, prefix, weights, eps=1e-6):
+            weight = weights.get_tensor(f"{prefix}.weight")
+            return cls(weight, eps)
+
+        def forward(self, hidden_states, residual=None):
+            if hidden_states.shape[-1] > 8192:
+                if residual is not None:
+                    hidden_states += residual
+                residual = hidden_states
+
+                hidden_states = hidden_states.to(torch.float32)
+                variance = hidden_states.pow(2).mean(-1, keepdim=True)
+                hidden_states = hidden_states * torch.rsqrt(
+                    variance + self.variance_epsilon
+                )
+
+                # convert into half-precision if necessary
+                if self.weight.dtype in [torch.float16, torch.bfloat16]:
+                    hidden_states = hidden_states.to(self.weight.dtype)
+
+                return self.weight * hidden_states, residual
+            elif IS_CUDA_SYSTEM:
+                # faster post attention rms norm
+                (
+                    normed_hidden_states,
+                    res,
+                    *rest,
+                ) = dropout_layer_norm.dropout_add_ln_fwd(
+                    hidden_states,
+                    residual,
+                    self.weight,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0.0,
+                    self.variance_epsilon,
+                    1.0,
+                    0,
+                    None,
+                    False,
+                    True,  # Activate RMSNorm
+                )
+                if res is None:
+                    res = hidden_states
+
+                return normed_hidden_states, res
+            elif IS_ROCM_SYSTEM:
+                # We use VLLM RMSNorm kernel that can be compiled for RoCm, instead of Flash Attention ones that can not.
+                if residual is not None:
+                    hidden_states += residual
+                residual = hidden_states
+
+                out = torch.empty_like(hidden_states)
+                layernorm_ops.rms_norm(
+                    out,
+                    hidden_states,
+                    self.weight.data,
+                    self.variance_epsilon,
+                )
+                return out, residual
+            else:
+                raise ValueError(
+                    "Your system seem to be not supported. Please check your install or open an issue at https://github.com/huggingface/text-generation-inference/issues with a clear reproduction."
+                )
+
 except ImportError:
     pass
 
-
 try:
-    from flash_attn.layers.rotary import RotaryEmbedding
-    import rotary_emb
+    if IS_CUDA_SYSTEM:
+        from flash_attn.layers.rotary import RotaryEmbedding
+        import rotary_emb
+    elif IS_ROCM_SYSTEM:
+        from vllm import pos_encoding_ops
 
     def _create_inv_freq(dim, base, device):
         inv_freq = 1.0 / (
@@ -584,6 +688,38 @@ try:
             self.scaling_factor = scaling_factor
             self.dynamic_args = None
 
+        def forward(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+        ):
+            # Such controlflows may add some overhead.
+            if IS_CUDA_SYSTEM:
+                rotary_dim = cos.shape[-1]
+                q1 = query[..., :rotary_dim]
+                q2 = query[..., rotary_dim : 2 * rotary_dim]
+
+                rotary_emb.apply_rotary(q1, q2, cos, sin, q1, q2, False)
+
+                k1 = key[..., :rotary_dim]
+                k2 = key[..., rotary_dim : 2 * rotary_dim]
+
+                rotary_emb.apply_rotary(k1, k2, cos, sin, k1, k2, False)
+            elif IS_ROCM_SYSTEM:
+                # NOTE: On RoCm systems, we use a ROPE implementatation adapted from VLLM which launches a single kernel for both query/key, contrary to flash-attn implementation used on NVIDIA systems.
+                # Compiling flash-attn rotary on RoCm, it appears hipcc is unable to unroll loops, resulting in an even slower inference compared to eager: https://github.com/pytorch/pytorch/issues/113773
+
+                head_size = query.shape[-1]
+
+                # Inplace operation, updating query and key.
+                pos_encoding_ops.rotary_embedding(query, key, head_size, cos, sin, True)
+            else:
+                raise ValueError(
+                    "Your system seem to be not supported. Please check your install or open an issue at https://github.com/huggingface/text-generation-inference/issues with a clear reproduction."
+                )
+
         @classmethod
         def static(cls, config, dim, base, device):
             inv_freq = _create_inv_freq(dim, base, device)
@@ -604,15 +740,16 @@ try:
                 elif rope_scaling["type"] == "yarn":
                     return YarnPositionRotaryEmbedding(
                         dim=2 * inv_freq.shape[0],
-                        max_position_embeddings=rope_scaling["original_max_position_embeddings"],
+                        max_position_embeddings=rope_scaling[
+                            "original_max_position_embeddings"
+                        ],
                         base=10000.0,
                         device=inv_freq.device,
                         scaling_factor=scaling_factor,
                         extrapolation_factor=1,
                         attn_factor=1,
                         beta_fast=32,
-                        beta_slow=1
-
+                        beta_slow=1,
                     )
                 else:
                     raise NotImplementedError(
@@ -645,15 +782,16 @@ try:
                 elif rope_scaling["type"] == "yarn":
                     return YarnPositionRotaryEmbedding(
                         dim=2 * inv_freq.shape[0],
-                        max_position_embeddings=rope_scaling["original_max_position_embeddings"],
+                        max_position_embeddings=rope_scaling[
+                            "original_max_position_embeddings"
+                        ],
                         base=10000.0,
                         device=inv_freq.device,
                         scaling_factor=scaling_factor,
                         extrapolation_factor=1,
                         attn_factor=1,
                         beta_fast=32,
-                        beta_slow=1
-
+                        beta_slow=1,
                     )
                 else:
                     raise NotImplementedError(
@@ -686,20 +824,18 @@ try:
             """
             Return cos and sin for the asked position ids
             """
+            if IS_ROCM_SYSTEM:
+                # For RoCm, we always use float cos/sin to avoid a cast.
+                # For NVIDIA, for some reason, the flash-attn rotary kernel requires cos/sin and query/key to be of same dtype: https://github.com/Dao-AILab/flash-attention/blob/017716451d446e464dde9aca3a3c1ed2209caaa9/csrc/rotary/rotary.cpp#L26
+                # But later on goes and cast cos/sin to float anyway: https://github.com/Dao-AILab/flash-attention/blob/017716451d446e464dde9aca3a3c1ed2209caaa9/csrc/rotary/rotary_cuda.cu#L29, which looks suboptimal.
+                dtype = torch.float32
 
             self._update_cos_sin_cache(dtype, position_ids.device, max_s)
 
             cos = torch.index_select(self._cos_cached, 0, position_ids)
             sin = torch.index_select(self._sin_cached, 0, position_ids)
+            # Note: this unsqueeze is not necessary on RoCm + VLLM ROPE implementation, but we leave it as is to avoid yet an other controlflow.
             return cos.unsqueeze(1), sin.unsqueeze(1)
-
-        def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-            rotary_dim = cos.shape[-1]
-            x1 = x[..., :rotary_dim]
-            x2 = x[..., rotary_dim : 2 * rotary_dim]
-
-            rotary_emb.apply_rotary(x1, x2, cos, sin, x1, x2, False)
-            return x
 
     class DynamicPositionRotaryEmbedding(PositionRotaryEmbedding):
         def __init__(self, dim, max_position_embeddings, base, device, scaling_factor):
@@ -734,19 +870,27 @@ try:
                 self._cos_cached = torch.cos(freqs).to(dtype)
                 self._sin_cached = torch.sin(freqs).to(dtype)
 
-
     # Inverse dim formula to find dim based on number of rotations
     import math
-    def find_correction_dim(num_rotations, dim, base=10000, max_position_embeddings=2048):
-        return (dim * math.log(max_position_embeddings/(num_rotations * 2 * math.pi)))/(2 * math.log(base))
+
+    def find_correction_dim(
+        num_rotations, dim, base=10000, max_position_embeddings=2048
+    ):
+        return (
+            dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))
+        ) / (2 * math.log(base))
 
     # Find dim range bounds based on rotations
-    def find_correction_range(low_rot, high_rot, dim, base=10000, max_position_embeddings=2048):
-        low = math.floor(find_correction_dim(
-            low_rot, dim, base, max_position_embeddings))
-        high = math.ceil(find_correction_dim(
-            high_rot, dim, base, max_position_embeddings))
-        return max(low, 0), min(high, dim-1)  # Clamp values just in case
+    def find_correction_range(
+        low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
+    ):
+        low = math.floor(
+            find_correction_dim(low_rot, dim, base, max_position_embeddings)
+        )
+        high = math.ceil(
+            find_correction_dim(high_rot, dim, base, max_position_embeddings)
+        )
+        return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
     def linear_ramp_mask(min, max, dim):
         if min == max:
@@ -762,7 +906,19 @@ try:
         return 0.1 * math.log(scale) + 1.0
 
     class YarnPositionRotaryEmbedding(PositionRotaryEmbedding):
-        def __init__(self, dim, max_position_embeddings, base, device, scaling_factor,*, extrapolation_factor, attn_factor, beta_fast, beta_slow):
+        def __init__(
+            self,
+            dim,
+            max_position_embeddings,
+            base,
+            device,
+            scaling_factor,
+            *,
+            extrapolation_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow,
+        ):
             inv_freq = _create_inv_freq(dim, base, device)
             super().__init__(inv_freq, scaling_factor)
             self.dim = dim
@@ -772,7 +928,9 @@ try:
             self.attn_factor = attn_factor
             self.beta_fast = beta_fast
             self.beta_slow = beta_slow
-            self.mscale = float(get_mscale(self.scaling_factor) * self.attn_factor) # Get n-d magnitude scaling corrected for interpolation
+            self.mscale = float(
+                get_mscale(self.scaling_factor) * self.attn_factor
+            )  # Get n-d magnitude scaling corrected for interpolation
 
         def _update_cos_sin_cache(self, dtype, device, seqlen):
             # Reset the tables if the sequence length has changed,
@@ -788,13 +946,26 @@ try:
                     )
                     freqs = 1.0 / inv_freq_extrapolation
                     inv_freq_interpolation = 1.0 / (self.scaling_factor * freqs)
-                    low, high = find_correction_range(self.beta_fast, self.beta_slow, self.dim, self.base, self.max_position_embeddings)
-                    inv_freq_mask = (1 - linear_ramp_mask(low, high, self.dim // 2).float().to(device)) * self.extrapolation_factor # Get n-d rotational scaling corrected for extrapolation
-                    inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
+                    low, high = find_correction_range(
+                        self.beta_fast,
+                        self.beta_slow,
+                        self.dim,
+                        self.base,
+                        self.max_position_embeddings,
+                    )
+                    inv_freq_mask = (
+                        1
+                        - linear_ramp_mask(low, high, self.dim // 2).float().to(device)
+                    ) * self.extrapolation_factor  # Get n-d rotational scaling corrected for extrapolation
+                    inv_freq = (
+                        inv_freq_interpolation * (1 - inv_freq_mask)
+                        + inv_freq_extrapolation * inv_freq_mask
+                    )
 
                     self.inv_freq = inv_freq
-                    self.mscale = float(get_mscale(self.scaling_factor) * self.attn_factor) # Get n-d magnitude scaling corrected for interpolation
-
+                    self.mscale = float(
+                        get_mscale(self.scaling_factor) * self.attn_factor
+                    )  # Get n-d magnitude scaling corrected for interpolation
 
                 self._seq_len_cached = seqlen
                 t = torch.arange(seqlen, device=device, dtype=self.inv_freq.dtype)

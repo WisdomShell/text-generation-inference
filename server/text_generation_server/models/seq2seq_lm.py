@@ -1,18 +1,18 @@
-from text_generation_server.utils.tokens import batch_top_tokens
 import torch
+import time
 
 from dataclasses import dataclass
 from opentelemetry import trace
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, PreTrainedTokenizerBase
 from typing import Optional, Tuple, List, Type, Dict
 
+from text_generation_server.utils.tokens import batch_top_tokens
 from text_generation_server.models import Model
 from text_generation_server.models.types import (
     GeneratedText,
     Batch,
     Generation,
-    PrefillTokens,
-    TopTokens,
+    Tokens,
 )
 from text_generation_server.pb import generate_pb2
 from text_generation_server.utils import NextTokenChooser, StoppingCriteria, Sampling
@@ -614,7 +614,8 @@ class Seq2SeqLM(Model):
     @tracer.start_as_current_span("generate_token")
     def generate_token(
         self, batch: Seq2SeqLMBatch
-    ) -> Tuple[List[Generation], Optional[Seq2SeqLMBatch]]:
+    ) -> Tuple[List[Generation], Optional[Seq2SeqLMBatch], Tuple[int, int]]:
+        start = time.time_ns()
         if batch.decoder_attention_mask is not None:
             # slice to the correct shape
             decoder_attention_mask = batch.decoder_attention_mask[
@@ -639,11 +640,16 @@ class Seq2SeqLM(Model):
             batch.past_key_values,
         )
 
+        # Speculation is not active for seq2seq
+        accepted_ids = torch.ones_like(batch.decoder_input_ids)[:, 0]
         batch_top_token_ids, batch_top_token_logprobs = batch_top_tokens(
             batch.top_n_tokens,
             batch.top_n_tokens_tensor,
             torch.log_softmax(logits[:, -1], -1),
+            accepted_ids,
         )
+
+        start_decode = time.time_ns()
 
         # Finished requests
         generations: List[Generation] = []
@@ -733,39 +739,46 @@ class Seq2SeqLM(Model):
 
                 # Prefill
                 if stopping_criteria.current_tokens == 1 and request.prefill_logprobs:
-                    prefill_tokens = PrefillTokens(
+                    prefill_tokens = Tokens(
                         [self.tokenizer.bos_token_id],
                         [float("nan")],
                         [self.tokenizer.bos_token],
+                        [False],
                     )
                 else:
                     prefill_tokens = None
 
                 if top_n_tokens > 0:
-                    toptoken_texts = self.tokenizer.batch_decode(
-                        top_token_ids,
-                        clean_up_tokenization_spaces=False,
-                        skip_special_tokens=False,
-                    )
-                    special_toptokens = [
-                        token_id in self.all_special_ids for token_id in top_token_ids
-                    ]
-                    top_tokens = TopTokens(
-                        top_token_ids,
-                        top_token_logprobs,
-                        toptoken_texts,
-                        special_toptokens,
-                    )
+                    all_top_tokens = []
+                    for (top_token_ids, top_token_logprobs) in zip(top_token_ids, top_token_logprobs):
+                        toptoken_texts = self.tokenizer.batch_decode(
+                            top_token_ids,
+                            clean_up_tokenization_spaces=False,
+                            skip_special_tokens=False,
+                        )
+                        special_toptokens = [
+                            token_id in self.all_special_ids for token_id in top_token_ids
+                        ]
+                        top_tokens = Tokens(
+                            top_token_ids,
+                            top_token_logprobs,
+                            toptoken_texts,
+                            special_toptokens,
+                        )
+                        all_top_tokens.append(top_tokens)
+                    top_tokens = all_top_tokens
                 else:
                     top_tokens = None
 
                 generation = Generation(
                     request.id,
                     prefill_tokens,
-                    next_token_id_squeezed,
-                    next_token_logprob,
-                    next_token_text,
-                    next_token_id_squeezed.item() in self.all_special_ids,
+                    Tokens(
+                        [next_token_id_squeezed],
+                        [next_token_logprob],
+                        [next_token_text],
+                        [next_token_id_squeezed.item() in self.all_special_ids],
+                    ),
                     generated_text,
                     top_tokens,
                 )
@@ -786,7 +799,9 @@ class Seq2SeqLM(Model):
 
         # We finished all generations in the batch; there is no next batch
         if stopped:
-            return generations, None
+            forward_ns = start_decode - start
+            decode_ns = time.time_ns() - start_decode
+            return generations, None, (forward_ns, decode_ns)
 
         # We don't need input_ids after the prefill forward
         batch.input_ids = None
@@ -797,4 +812,6 @@ class Seq2SeqLM(Model):
             batch.decoder_attention_mask[:, -batch.padding_right_offset] = 1
         batch.padding_right_offset -= 1
 
-        return generations, batch
+        forward_ns = start_decode - start
+        decode_ns = time.time_ns() - start_decode
+        return generations, batch, (forward_ns, decode_ns)

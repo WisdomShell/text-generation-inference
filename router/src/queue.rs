@@ -5,7 +5,7 @@ use nohash_hasher::{BuildNoHashHasher, IntMap};
 use std::cmp::min;
 use std::collections::VecDeque;
 use text_generation_client::{Batch, Request};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{info_span, instrument, Span};
 
@@ -15,7 +15,7 @@ pub(crate) struct Entry {
     /// Request
     pub request: ValidGenerateRequest,
     /// Response sender to communicate between the Infer struct and the batching_task
-    pub response_tx: flume::Sender<Result<InferStreamResponse, InferError>>,
+    pub response_tx: mpsc::UnboundedSender<Result<InferStreamResponse, InferError>>,
     /// Span that will live as long as entry
     pub span: Span,
     /// Temporary span used as a guard when logging inference, wait times...
@@ -30,19 +30,25 @@ pub(crate) struct Entry {
 #[derive(Debug, Clone)]
 pub(crate) struct Queue {
     /// Channel to communicate with the background queue task
-    queue_sender: flume::Sender<QueueCommand>,
+    queue_sender: mpsc::UnboundedSender<QueueCommand>,
 }
 
 impl Queue {
-    pub(crate) fn new(requires_padding: bool, block_size: u32, window_size: Option<u32>) -> Self {
+    pub(crate) fn new(
+        requires_padding: bool,
+        block_size: u32,
+        window_size: Option<u32>,
+        speculate: u32,
+    ) -> Self {
         // Create channel
-        let (queue_sender, queue_receiver) = flume::unbounded();
+        let (queue_sender, queue_receiver) = mpsc::unbounded_channel();
 
         // Launch background queue task
         tokio::spawn(queue_task(
             requires_padding,
             block_size,
             window_size,
+            speculate,
             queue_receiver,
         ));
 
@@ -91,11 +97,12 @@ async fn queue_task(
     requires_padding: bool,
     block_size: u32,
     window_size: Option<u32>,
-    receiver: flume::Receiver<QueueCommand>,
+    speculate: u32,
+    mut receiver: mpsc::UnboundedReceiver<QueueCommand>,
 ) {
-    let mut state = State::new(requires_padding, block_size, window_size);
+    let mut state = State::new(requires_padding, block_size, window_size, speculate);
 
-    while let Ok(cmd) = receiver.recv_async().await {
+    while let Some(cmd) = receiver.recv().await {
         match cmd {
             QueueCommand::Append(entry, span) => {
                 span.in_scope(|| state.append(*entry));
@@ -136,10 +143,18 @@ struct State {
 
     /// Sliding window
     window_size: Option<u32>,
+
+    /// Speculation amount
+    speculate: u32,
 }
 
 impl State {
-    fn new(requires_padding: bool, block_size: u32, window_size: Option<u32>) -> Self {
+    fn new(
+        requires_padding: bool,
+        block_size: u32,
+        window_size: Option<u32>,
+        speculate: u32,
+    ) -> Self {
         Self {
             entries: VecDeque::with_capacity(128),
             next_id: 0,
@@ -147,6 +162,7 @@ impl State {
             requires_padding,
             block_size,
             window_size,
+            speculate,
         }
     }
 
@@ -195,7 +211,7 @@ impl State {
         while let Some((id, mut entry)) = self.entries.pop_front() {
             // Filter entries where the response receiver was dropped (== entries where the request
             // was dropped by the client)
-            if entry.response_tx.is_disconnected() {
+            if entry.response_tx.is_closed() {
                 metrics::increment_counter!("tgi_request_failure", "err" => "dropped");
                 continue;
             }
@@ -229,7 +245,7 @@ impl State {
             }
 
             if prefill_tokens > prefill_token_budget
-                || (prefill_tokens + decode_tokens) > token_budget
+                || (prefill_tokens + decode_tokens + self.speculate) > token_budget
             {
                 // Entry is over budget
                 // Add it back to the front
@@ -321,9 +337,9 @@ mod tests {
 
     fn default_entry() -> (
         Entry,
-        flume::Receiver<Result<InferStreamResponse, InferError>>,
+        mpsc::UnboundedReceiver<Result<InferStreamResponse, InferError>>,
     ) {
-        let (response_tx, receiver_tx) = flume::unbounded();
+        let (response_tx, receiver_tx) = mpsc::unbounded_channel();
 
         let entry = Entry {
             request: ValidGenerateRequest {
@@ -359,7 +375,7 @@ mod tests {
 
     #[test]
     fn test_append() {
-        let mut state = State::new(false, 1, None);
+        let mut state = State::new(false, 1, None, 0);
         let (entry, _guard) = default_entry();
 
         assert_eq!(state.next_id, 0);
@@ -375,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_next_batch_empty() {
-        let mut state = State::new(false, 1, None);
+        let mut state = State::new(false, 1, None, 0);
 
         assert!(state.next_batch(None, 1, 1).is_none());
         assert!(state.next_batch(Some(1), 1, 1).is_none());
@@ -383,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_next_batch_min_size() {
-        let mut state = State::new(false, 1, None);
+        let mut state = State::new(false, 1, None, 0);
         let (entry1, _guard1) = default_entry();
         let (entry2, _guard2) = default_entry();
         state.append(entry1);
@@ -415,7 +431,7 @@ mod tests {
 
     #[test]
     fn test_next_batch_token_budget() {
-        let mut state = State::new(false, 1, None);
+        let mut state = State::new(false, 1, None, 0);
         let (entry1, _guard1) = default_entry();
         let (entry2, _guard2) = default_entry();
         state.append(entry1);
@@ -448,14 +464,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_append() {
-        let queue = Queue::new(false, 1, None);
+        let queue = Queue::new(false, 1, None, 0);
         let (entry, _guard) = default_entry();
         queue.append(entry);
     }
 
     #[tokio::test]
     async fn test_queue_next_batch_empty() {
-        let queue = Queue::new(false, 1, None);
+        let queue = Queue::new(false, 1, None, 0);
 
         assert!(queue.next_batch(None, 1, 1).await.is_none());
         assert!(queue.next_batch(Some(1), 1, 1).await.is_none());
@@ -463,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_next_batch_min_size() {
-        let queue = Queue::new(false, 1, None);
+        let queue = Queue::new(false, 1, None, 0);
         let (entry1, _guard1) = default_entry();
         let (entry2, _guard2) = default_entry();
         queue.append(entry1);
@@ -496,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_next_batch_token_budget() {
-        let queue = Queue::new(false, 1, None);
+        let queue = Queue::new(false, 1, None, 0);
         let (entry1, _guard1) = default_entry();
         let (entry2, _guard2) = default_entry();
         queue.append(entry1);
@@ -520,8 +536,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_queue_next_batch_token_speculate() {
+        let queue = Queue::new(false, 1, None, 2);
+        let (entry1, _guard1) = default_entry();
+        let (entry2, _guard2) = default_entry();
+        queue.append(entry1);
+        queue.append(entry2);
+
+        // Budget of 1 is not enough
+        assert!(queue.next_batch(None, 1, 1).await.is_none());
+
+        let (entries, batch, _) = queue.next_batch(None, 6, 6).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains_key(&0));
+        assert!(entries.contains_key(&1));
+        assert_eq!(batch.id, 0);
+        assert_eq!(batch.size, 2);
+    }
+
+    #[tokio::test]
     async fn test_queue_next_batch_dropped_receiver() {
-        let queue = Queue::new(false, 1, None);
+        let queue = Queue::new(false, 1, None, 0);
         let (entry, _) = default_entry();
         queue.append(entry);
 

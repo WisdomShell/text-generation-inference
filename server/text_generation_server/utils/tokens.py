@@ -92,7 +92,7 @@ class NextTokenChooser:
 class StopSequenceCriteria:
     def __init__(self, stop_sequence: str):
         stop_sequence = re.escape(stop_sequence)
-        self.regex = re.compile(f".*{stop_sequence}$")
+        self.regex = re.compile(f"{stop_sequence}$")
 
     def __call__(self, output: str) -> bool:
         if self.regex.findall(output):
@@ -123,10 +123,15 @@ class StoppingCriteria:
         if not self.ignore_eos_token and last_token == self.eos_token_id:
             return True, FinishReason.FINISH_REASON_EOS_TOKEN
 
-        self.current_output += last_output
-        for stop_sequence_criteria in self.stop_sequence_criterias:
-            if stop_sequence_criteria(self.current_output):
-                return True, FinishReason.FINISH_REASON_STOP_SEQUENCE
+        if self.stop_sequence_criterias:
+            self.current_output += last_output
+            # There is no need to keep an output that is too long
+            if len(self.current_output) > 300:
+                # Slice to -200 to avoid doing it all the time
+                self.current_output = self.current_output[-200:]
+            for stop_sequence_criteria in self.stop_sequence_criterias:
+                if stop_sequence_criteria(self.current_output):
+                    return True, FinishReason.FINISH_REASON_STOP_SEQUENCE
 
         return False, None
 
@@ -145,6 +150,30 @@ class StoppingCriteria:
             pb.max_new_tokens,
             pb.ignore_eos_token,
         )
+
+
+def create_n_gram_speculation(
+    input_ids: torch.Tensor,
+    next_ids: torch.Tensor,
+    accepted_ids: torch.Tensor,
+    speculate: int,
+    verbose: bool,
+):
+    # Very trivial approach, find first match in the string.
+    # This is much less refined than actual n-gram but seems to work
+    # relatively OK in grounded mode and is by far much faster with
+    # much less worst case complexity as everything happens on device.
+    B = accepted_ids.shape[0]
+    device = input_ids.device
+    seeds = next_ids[accepted_ids.cumsum(dim=-1) - 1]
+    indices = (input_ids == seeds.unsqueeze(-1)).max(dim=1).indices + 1
+    all_indices = indices.unsqueeze(-1).expand(B, speculate) + torch.arange(
+        speculate, device=device
+    )
+    all_indices = torch.clamp(all_indices, max=input_ids.shape[1] - 1)
+
+    speculative_ids = input_ids.gather(dim=-1, index=all_indices)
+    return speculative_ids
 
 
 class HeterogeneousNextTokenChooser:
@@ -215,20 +244,92 @@ class HeterogeneousNextTokenChooser:
         self.dtype = dtype
         self.device = device
 
-    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor):
-        if self.watermark_processor is not None:
-            scores = self.watermark_processor(input_ids, scores)
-        if self.repetition_processor is not None:
-            scores = self.repetition_processor(input_ids, scores)
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        scores: torch.Tensor,
+        speculate: int,
+        speculated_ids: Optional[torch.Tensor] = None,
+        speculative_scores: Optional[torch.Tensor] = None,
+        verbose=False,
+    ):
+        if speculated_ids is not None:
+            B = scores.shape[0] // (speculated_ids.shape[1] + 1)
+            S = speculated_ids.shape[1] + 1
+            scores = scores.view(B, S, -1)
+        else:
+            B = scores.shape[0]
+            S = 1
+            scores = scores.view(B, S, -1)
 
-        for warper in self.warpers:
-            scores = warper(input_ids, scores)
+        next_ids = torch.zeros((B, S), device=scores.device, dtype=torch.long)
+        for j in range(S):
+            _scores = scores[:, j]
+            if self.watermark_processor is not None:
+                _scores = self.watermark_processor(input_ids, _scores)
+            if self.repetition_processor is not None:
+                _scores = self.repetition_processor(input_ids, _scores)
 
-        next_ids = self.choice(scores)
-        logprobs = torch.log_softmax(scores, -1)
+            for warper in self.warpers:
+                _scores = warper(input_ids, _scores)
+
+            _next_ids = self.choice(_scores)
+            scores[:, j] = _scores
+            next_ids[:, j] = _next_ids
+        next_ids = next_ids.view(B * S)
+        allscores = scores.view(B * S, -1)
+        alllogprobs = torch.log_softmax(allscores, -1)
+
+        if speculated_ids is not None:
+            accepted_ids = []
+            B = next_ids.shape[0] // (speculated_ids.shape[1] + 1)
+            S = speculated_ids.shape[1] + 1
+            indices = []
+            for i in range(B):
+                _next_ids = next_ids[i * S : (i + 1) * S]
+                _speculated_ids = speculated_ids[i]
+                validate_speculative = _next_ids[:-1] == _speculated_ids
+                index = i * S
+                accepted = 1
+                # First is always valid
+                indices.append(index)
+                for valid in validate_speculative.tolist():
+                    if valid:
+                        index += 1
+                        accepted += 1
+                        indices.append(index)
+                    else:
+                        break
+                accepted_ids.append(accepted)
+
+            accepted_ids = torch.tensor(
+                accepted_ids, device=input_ids.device, dtype=input_ids.dtype
+            )
+            next_ids = next_ids[indices]
+            logprobs = alllogprobs[indices]
+            indices = torch.arange(B, device=input_ids.device) * S
+            if speculative_scores is not None:
+                speculative_scores = speculative_scores[indices + accepted_ids - 1]
+        else:
+            accepted_ids = torch.ones_like(next_ids)
+            logprobs = alllogprobs
+
         next_logprobs = torch.gather(logprobs, 1, next_ids.view(-1, 1)).view(-1)
 
-        return next_ids, next_logprobs, logprobs
+
+        if speculate > 0:
+            if speculative_scores is not None:
+                # Medusa provided some scores
+                speculative_ids = Greedy()(speculative_scores)
+            else:
+                # n-gram
+                speculative_ids = create_n_gram_speculation(
+                    input_ids, next_ids, accepted_ids, speculate, verbose
+                )
+        else:
+            speculative_ids = None
+
+        return next_ids, next_logprobs, alllogprobs, accepted_ids, speculative_ids
 
     def filter(self, indices):
         if self.watermark_processor is not None:
@@ -337,8 +438,8 @@ class HeterogeneousSampling:
 
 
 def batch_top_tokens(
-    top_n_tokens: List[int], top_n_tokens_tensor: torch.Tensor, logprobs: torch.Tensor
-) -> Tuple[List[List[int]], List[List[float]]]:
+    top_n_tokens: List[int], top_n_tokens_tensor: torch.Tensor, logprobs: torch.Tensor, accepted_ids: torch.Tensor
+) -> Tuple[List[List[List[int]]], List[List[List[float]]]]:
     """Find the top n most likely tokens for a batch of generations.
 
     When multiple tokens have equal probabilities and they don't all fit, the
@@ -347,14 +448,19 @@ def batch_top_tokens(
     max_top_n = max(top_n_tokens)
     # Early exit when top_n_tokens is not used
     if max_top_n == 0:
-        return [[]] * len(top_n_tokens), [[]] * len(top_n_tokens)
+        return [[[]]] * len(top_n_tokens), [[[]]] * len(top_n_tokens)
 
+
+    batch_size = accepted_ids.shape[0]
+    speculate_size = logprobs.shape[0] // batch_size
+    top_n_tokens_tensor = top_n_tokens_tensor.repeat_interleave(speculate_size)
     # Ensure top_n doesn't exceed vocab size
-    top_n_tokens = [min(tok, logprobs.size(-1)) for tok in top_n_tokens]
+    top_n_tokens = [min(tok, logprobs.size(-1)) for tok in top_n_tokens for _ in range(speculate_size)]
 
     # Parallel kthvalue adapted from https://discuss.pytorch.org/t/how-to-efficiently-get-the-k-th-largest-values-in-parallel/160529/2
     # Sorted topk is faster than torch.sort() since we only need a small subset
-    sorted_top_k = torch.topk(logprobs, k=max_top_n, dim=1, sorted=True).values
+    sorted_top_k = torch.topk(logprobs, k=max_top_n, dim=-1, sorted=True).values
+
     nth_highest = torch.gather(
         sorted_top_k, 1, (top_n_tokens_tensor - 1).clip(min=0).unsqueeze(1)
     )
@@ -372,13 +478,33 @@ def batch_top_tokens(
     top_indices = top_k.indices.tolist()
     top_values = top_k.values.tolist()
 
-    return (
-        [
-            idxs[:n] if req_n > 0 else []
-            for idxs, n, req_n in zip(top_indices, top_n_ishes, top_n_tokens)
-        ],
-        [
-            vals[:n] if req_n > 0 else []
-            for vals, n, req_n in zip(top_values, top_n_ishes, top_n_tokens)
-        ],
-    )
+    batch_top_token_ids = []
+    batch_top_token_logprobs = []
+    accepted_ids_list = accepted_ids.tolist()
+    for i, n_accepted_ids in enumerate(accepted_ids_list):
+        start = speculate_size * i
+        stop = speculate_size * (i + 1)
+        _top_indices = top_indices[start: stop]
+        _top_values = top_values[start: stop]
+        _top_n_ishes = top_n_ishes[start: stop]
+        _top_n_tokens = top_n_tokens[start: stop]
+
+        _top_indices = _top_indices[:n_accepted_ids]
+        _top_values = _top_values[:n_accepted_ids]
+        _top_n_ishes = _top_n_ishes[:n_accepted_ids]
+        _top_n_tokens = _top_n_tokens[:n_accepted_ids]
+
+        row_top_token_ids = []
+        row_top_token_logprobs = []
+
+        for idxs, vals, n, req_n in zip(_top_indices, _top_values, _top_n_ishes, _top_n_tokens):
+            indices = idxs[:n] if req_n > 0 else []
+            values = vals[:n] if req_n > 0 else []
+
+            row_top_token_ids.append(indices)
+            row_top_token_logprobs.append(values)
+
+        batch_top_token_ids.append(row_top_token_ids)
+        batch_top_token_logprobs.append(row_top_token_logprobs)
+
+    return batch_top_token_ids, batch_top_token_logprobs
