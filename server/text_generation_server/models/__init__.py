@@ -288,6 +288,9 @@ def get_model(
                 trust_remote_code=trust_remote_code,
             )
     elif model_type in {"shell", "codeshell", "kclgpt"}:
+        print("model_type", model_type)
+        print("FLASH_ATTENTION", FLASH_ATTENTION)
+        print("sharded", sharded)
         if FLASH_ATTENTION:
             return FlashShell(
                 model_id,

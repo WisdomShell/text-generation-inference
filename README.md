@@ -88,7 +88,7 @@ For a detailed starting guide, please see the [Quick Tour](https://huggingface.c
 model=WisdomShell/CodeShell-7B
 volume=$PWD/data # share a volume with the Docker container to avoid downloading weights every run
 
-docker run --gpus all --shm-size 1g -p 8080:80 -v $volume:/data zzr0/text-generation-inference:codeshell-1.1.1 --model-id $model
+docker run --gpus all --shm-size 1g -p 8080:80 -v $volume:/data zzr0/text-generation-inference:codeshell-1.4 --model-id $model
 ```
 **Note:** To use GPUs, you need to install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). We also recommend using NVIDIA drivers with CUDA version 11.8 or higher. For running the Docker container on a machine with no GPUs or CUDA support, it is enough to remove the `--gpus all` flag and add `--disable-custom-kernels`, please note CPU is not the intended platform for this project, so performance might be subpar.
 
@@ -138,7 +138,7 @@ model=WisdomShell/CodeShell-7B
 volume=$PWD/data # share a volume with the Docker container to avoid downloading weights every run
 token=<your cli READ token>
 
-docker run --gpus all --shm-size 1g -e HUGGING_FACE_HUB_TOKEN=$token -p 8080:80 -v $volume:/data zzr0/text-generation-inference:codeshell-1.1.1 --model-id $model
+docker run --gpus all --shm-size 1g -e HUGGING_FACE_HUB_TOKEN=$token -p 8080:80 -v $volume:/data zzr0/text-generation-inference:codeshell-1.4 --model-id $model
 ```
 
 ### A note on Shared Memory (shm)
