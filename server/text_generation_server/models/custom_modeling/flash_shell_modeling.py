@@ -26,22 +26,15 @@ from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from typing import Optional, List, Tuple
 
-# Flash attention imports
-import dropout_layer_norm
-
-# vllm imports
-import vllm_cache_ops
-import vllm_attention_ops
-
-from text_generation_server.utils.flash_attn import attention
+from text_generation_server.utils import paged_attention, flash_attn
 from text_generation_server.utils.layers import (
     TensorParallelRowLinear,
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
     PositionRotaryEmbedding,
     TensorParallelHead,
-    FastLayerNorm,
     get_linear,
+    FastLayerNorm,
 )
 
 
@@ -180,11 +173,11 @@ class FlashShellAttention(torch.nn.Module):
         self.hidden_size = config.hidden_size
         self.head_size = self.hidden_size // self.num_heads
 
-        # self.rotary_emb = PositionRotaryEmbedding.load(
-        #     config=config, prefix=f"{prefix}.rotary_emb", weights=weights
-        # )
         self.rotary_emb = PositionRotaryEmbedding.static(
-            config=config, dim=self.head_size, base=config.rope_theta, device=weights.device
+            config=config,
+            dim=self.head_size,
+            base=config.rope_theta,
+            device=weights.device,
         )
 
         self.softmax_scale = self.head_size**-0.5
@@ -195,7 +188,6 @@ class FlashShellAttention(torch.nn.Module):
                 f"and `num_shards`: {weights.process_group.size()}"
             )
         self.num_heads = self.num_heads // weights.process_group.size()
-        # print("config.num_key_value_heads", config.num_key_value_heads)
         self.num_key_value_heads = (
             config.num_key_value_heads // weights.process_group.size()
         )
@@ -236,10 +228,9 @@ class FlashShellAttention(torch.nn.Module):
         query = query.view(-1, self.num_heads, self.head_size)
         kv = kv.view(-1, 2, self.num_key_value_heads, self.head_size)
 
-        self.rotary_emb(query, cos, sin)
-        self.rotary_emb(torch.select(kv, dim=1, index=0), cos, sin)
+        self.rotary_emb(query, torch.select(kv, dim=1, index=0), cos, sin)
 
-        vllm_cache_ops.reshape_and_cache(
+        paged_attention.reshape_and_cache(
             kv[:, 0], kv[:, 1], kv_cache[0], kv_cache[1], slots
         )
 
@@ -249,7 +240,7 @@ class FlashShellAttention(torch.nn.Module):
         # Prefill
         if cu_seqlen_prefill is not None:
             # flash attention
-            attention(
+            flash_attn.attention(
                 query,
                 torch.select(kv, dim=1, index=0),
                 torch.select(kv, dim=1, index=1),
@@ -260,9 +251,7 @@ class FlashShellAttention(torch.nn.Module):
             )
         # Decode
         else:
-            # kv_cache[1] => [num_blocks, num_heads, head_size, block_size]
-            block_size = kv_cache[1].shape[3]
-            vllm_attention_ops.single_query_cached_kv_attention(
+            paged_attention.attention(
                 attn_output,
                 query,
                 kv_cache[0],
@@ -271,7 +260,6 @@ class FlashShellAttention(torch.nn.Module):
                 self.softmax_scale,
                 block_tables,
                 input_lengths,
-                block_size,
                 max_s,
             )
 
