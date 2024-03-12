@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from opentelemetry import trace
 from transformers import PreTrainedTokenizerBase
 from transformers.models.llama import LlamaTokenizerFast
-from typing import Optional, Tuple, Type, List
+from typing import Optional, Tuple, Type
 
 from text_generation_server.pb import generate_pb2
 from text_generation_server.models import FlashCausalLM
@@ -35,6 +35,21 @@ tracer = trace.get_tracer(__name__)
 SLIDING_WINDOW: Optional[int] = None
 SLIDING_WINDOW_BLOCKS: Optional[int] = None
 
+MEM_POOL = torch.cuda.graph_pool_handle()
+
+
+def set_sliding_window(sliding_window: int, sliding_window_blocks: int):
+    global SLIDING_WINDOW
+    global SLIDING_WINDOW_BLOCKS
+    SLIDING_WINDOW = sliding_window
+    SLIDING_WINDOW_BLOCKS = sliding_window_blocks
+
+
+def get_sliding_windows() -> Tuple[int, int]:
+    global SLIDING_WINDOW
+    global SLIDING_WINDOW_BLOCKS
+    return SLIDING_WINDOW, SLIDING_WINDOW_BLOCKS
+
 
 # Adds windowing logic to FlashCausalLMBatch
 @dataclass
@@ -51,8 +66,7 @@ class FlashMistralBatch(FlashCausalLMBatch):
         dtype: torch.dtype,
         device: torch.device,
     ) -> "FlashCausalLMBatch":
-        global SLIDING_WINDOW
-        global SLIDING_WINDOW_BLOCKS
+        sliding_window, sliding_window_blocks = get_sliding_windows()
 
         batch_inputs = []
         max_truncation = 0
@@ -137,8 +151,8 @@ class FlashMistralBatch(FlashCausalLMBatch):
 
             # Needed blocks can not go over SLIDING_WINDOW_BLOCKS
             needed_blocks = math.ceil(total_tokens / BLOCK_SIZE)
-            if SLIDING_WINDOW_BLOCKS is not None:
-                needed_blocks = min(needed_blocks, SLIDING_WINDOW_BLOCKS)
+            if sliding_window_blocks is not None:
+                needed_blocks = min(needed_blocks, sliding_window_blocks)
             blocks += needed_blocks
 
             needed_blocks_slots.append((needed_blocks, total_tokens))
@@ -152,9 +166,9 @@ class FlashMistralBatch(FlashCausalLMBatch):
             slot_indices.append(request_slot_indices)
 
             # Create tensor to slice into the kv tensor in prefill
-            if SLIDING_WINDOW is not None:
+            if sliding_window is not None:
                 request_prefill_cache_indices = torch.arange(
-                    cumulative_length + max(0, input_length - SLIDING_WINDOW),
+                    cumulative_length + max(0, input_length - sliding_window),
                     cumulative_length + input_length,
                     dtype=torch.int64,
                 )
@@ -190,7 +204,7 @@ class FlashMistralBatch(FlashCausalLMBatch):
             )
 
         next_token_chooser = HeterogeneousNextTokenChooser.from_pb(
-            next_token_chooser_parameters, dtype, device
+            next_token_chooser_parameters, dtype, device, tokenizer
         )
         start_slots = torch.tensor(start_slots, dtype=torch.int64)
 
@@ -210,13 +224,13 @@ class FlashMistralBatch(FlashCausalLMBatch):
             input_ids = np.concatenate(all_input_ids, dtype=np.int64)
             position_ids = torch.cat(position_ids)
             slot_indices = torch.cat(slot_indices)
-            if SLIDING_WINDOW is not None:
+            if sliding_window is not None:
                 prefill_cache_indices = torch.cat(prefill_cache_indices)
         else:
             input_ids = all_input_ids[0]
             position_ids = position_ids[0]
             slot_indices = slot_indices[0]
-            if SLIDING_WINDOW is not None:
+            if sliding_window is not None:
                 prefill_cache_indices = prefill_cache_indices[0]
 
         cu_seqlen_prefill = torch.tensor(
@@ -226,7 +240,7 @@ class FlashMistralBatch(FlashCausalLMBatch):
         position_ids = position_ids.to(device)
         slot_indices = slot_indices.to(device)
         prefill_cache_indices = (
-            prefill_cache_indices.to(device) if SLIDING_WINDOW is not None else None
+            prefill_cache_indices.to(device) if sliding_window is not None else None
         )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
         input_lengths_tensor = torch.tensor(
@@ -292,18 +306,16 @@ class BaseFlashMistral(FlashCausalLM):
         model_id: str,
         revision: Optional[str] = None,
         quantize: Optional[str] = None,
+        use_medusa: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
     ):
-        global SLIDING_WINDOW
-        global SLIDING_WINDOW_BLOCKS
-
         self.process_group, rank, world_size = initialize_torch_distributed()
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{rank}")
             dtype = torch.float16 if dtype is None else dtype
         else:
-            raise NotImplementedError("FlashLlama is only available on GPU")
+            raise NotImplementedError("FlashMistral is only available on GPU")
 
         tokenizer = LlamaTokenizerFast.from_pretrained(
             model_id,
@@ -317,11 +329,13 @@ class BaseFlashMistral(FlashCausalLM):
             model_id, revision=revision, trust_remote_code=trust_remote_code
         )
         config.quantize = quantize
+        config.use_medusa = use_medusa
 
         # Set context windows
         if config.sliding_window is not None:
-            SLIDING_WINDOW = config.sliding_window
-            SLIDING_WINDOW_BLOCKS = math.ceil(config.sliding_window / BLOCK_SIZE)
+            set_sliding_window(
+                config.sliding_window, math.ceil(config.sliding_window / BLOCK_SIZE)
+            )
 
         torch.distributed.barrier(group=self.process_group)
 
@@ -331,6 +345,8 @@ class BaseFlashMistral(FlashCausalLM):
             weights._set_gptq_params(model_id, revision)
 
         model = model_cls(config, weights)
+
+        self.cuda_graphs = {}
 
         torch.distributed.barrier(group=self.process_group)
         super(BaseFlashMistral, self).__init__(
@@ -350,7 +366,65 @@ class BaseFlashMistral(FlashCausalLM):
     def batch_type(self) -> Type[FlashMistralBatch]:
         return FlashMistralBatch
 
-    def forward(self, batch: FlashMistralBatch) -> Tuple[torch.Tensor, torch.Tensor]:
+    def cuda_graph_warmup(self, bs: int, max_s: int, max_bt: int):
+        input_ids = torch.zeros(bs, dtype=torch.int64, device=self.device)
+        position_ids = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        slots = torch.arange(bs, dtype=torch.int32, device=self.device)
+        input_lengths = torch.ones(bs, dtype=torch.int32, device=self.device) * max_s
+        block_tables = (
+            torch.arange(max_bt, dtype=torch.int32, device=self.device)
+            .repeat(bs)
+            .reshape((bs, max_bt))
+        )
+        kv_cache = get_cache_manager().kv_cache
+
+        self.cuda_graphs[bs] = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "kv_cache": kv_cache,
+            "block_tables": block_tables,
+            "slots": slots,
+            "input_lengths": input_lengths,
+        }
+        graph = torch.cuda.CUDAGraph()
+        self.cuda_graphs[bs]["graph"] = graph
+
+        torch.cuda.synchronize()
+        # Run once outside to warmup
+        self.model.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            cu_seqlen_prefill=None,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            slots=slots,
+            input_lengths=input_lengths,
+            max_s=max_s,
+            prefill_cache_indices=None,
+            lm_head_indices=None,
+        )
+        torch.cuda.synchronize()
+
+        with torch.cuda.graph(graph, pool=MEM_POOL):
+            logits, speculative_logits = self.model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                cu_seqlen_prefill=None,
+                kv_cache=kv_cache,
+                block_tables=block_tables,
+                slots=slots,
+                input_lengths=input_lengths,
+                max_s=max_s,
+                prefill_cache_indices=None,
+                lm_head_indices=None,
+            )
+            self.cuda_graphs[bs]["logits"] = logits
+            self.cuda_graphs[bs]["speculative_logits"] = speculative_logits
+        torch.cuda.synchronize()
+
+    def forward(
+        self, batch: FlashMistralBatch
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Model Forward
         if batch.speculative_ids is not None:
             input_ids = batch.input_ids
@@ -401,21 +475,65 @@ class BaseFlashMistral(FlashCausalLM):
             input_lengths = batch.input_lengths_tensor
             max_s = batch.max_seqlen
             lm_head_indices = batch.prefill_head_indices
-        logits = self.model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            cu_seqlen_prefill=cu_seqlen_prefill,
-            kv_cache=kv_cache,
-            block_tables=block_tables,
-            slots=slots,
-            input_lengths=input_lengths,
-            max_s=max_s,
-            prefill_cache_indices=batch.prefill_cache_indices,
-            lm_head_indices=lm_head_indices,
+
+        if cu_seqlen_prefill is None and self.model.max_past is not None:
+            # In decode, not prefill, we're actually overwriting the KV-cache
+            # in a circular buffer mode.
+            # This makes sure the max_s for the decode pass is correct.
+            max_s = min(self.model.max_past, max_s)
+
+        bs = input_ids.shape[0]
+        padded_bs = bs
+        if bs == 3:
+            padded_bs = 4
+        elif 3 < bs <= 8:
+            padded_bs = 8
+        elif bs > 8:
+            padded_bs = (bs + 7) // 8 * 8
+
+        # Try to find an associated cuda graph
+        cuda_graph = self.cuda_graphs.get(padded_bs, None)
+
+        if cu_seqlen_prefill is not None or cuda_graph is None:
+            logits, speculative_logits = self.model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                cu_seqlen_prefill=cu_seqlen_prefill,
+                kv_cache=kv_cache,
+                block_tables=block_tables,
+                slots=slots,
+                input_lengths=input_lengths,
+                max_s=max_s,
+                prefill_cache_indices=batch.prefill_cache_indices,
+                lm_head_indices=lm_head_indices,
+            )
+            if batch.prefill_cache_indices is not None:
+                batch.prefill_cache_indices = None
+            return logits, speculative_logits
+
+        # Copy inputs to the static inputs of the cuda graph
+        # Static inputs are potentially padded
+        cuda_graph["input_ids"][: input_ids.shape[0]] = input_ids
+        cuda_graph["position_ids"][: position_ids.shape[0]] = position_ids
+        cuda_graph["block_tables"][
+            : block_tables.shape[0], : block_tables.shape[1]
+        ] = block_tables
+        cuda_graph["slots"].fill_(-1)
+        cuda_graph["slots"][: slots.shape[0]] = slots
+        cuda_graph["input_lengths"].zero_()
+        cuda_graph["input_lengths"][: input_lengths.shape[0]] = input_lengths
+
+        # Replay the graph
+        cuda_graph["graph"].replay()
+
+        # Slice output to the correct shape
+        speculative_logits = (
+            cuda_graph["speculative_logits"][:bs]
+            if cuda_graph["speculative_logits"] is not None
+            else None
         )
-        if batch.prefill_cache_indices is not None:
-            batch.prefill_cache_indices = None
-        return logits
+        logits = cuda_graph["logits"][:bs]
+        return logits, speculative_logits
 
 
 class FlashMistral(BaseFlashMistral):
@@ -424,6 +542,7 @@ class FlashMistral(BaseFlashMistral):
         model_id: str,
         revision: Optional[str] = None,
         quantize: Optional[str] = None,
+        use_medusa: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
     ):
@@ -433,6 +552,7 @@ class FlashMistral(BaseFlashMistral):
             model_id=model_id,
             revision=revision,
             quantize=quantize,
+            use_medusa=use_medusa,
             dtype=dtype,
             trust_remote_code=trust_remote_code,
         )

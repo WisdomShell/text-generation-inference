@@ -51,6 +51,12 @@ message ClearCacheRequest {
 /// Empty response
 message ClearCacheResponse {}
 
+enum GrammarType {
+    GRAMMAR_TYPE_NONE = 0;
+    GRAMMAR_TYPE_JSON = 1;
+    GRAMMAR_TYPE_REGEX = 2;
+}
+
 message NextTokenChooserParameters {
     /// exponential scaling output probability distribution
     float temperature = 1;
@@ -66,8 +72,14 @@ message NextTokenChooserParameters {
     uint64 seed = 6;
     /// repetition penalty
     float repetition_penalty = 7;
+    /// frequency penalty
+    float frequency_penalty = 9;
     /// token watermarking using "A Watermark for Large Language Models"
     bool watermark = 8;
+    /// grammar (applied if not empty)
+    string grammar = 10;
+    /// grammar type
+    GrammarType grammar_type = 11;
 }
 
 message StoppingCriteriaParameters {
@@ -218,7 +230,6 @@ message WarmupRequest {
     uint32 max_total_tokens = 4;
 }
 
-/// Empty response
 message WarmupResponse {
     /// Maximum number of tokens supported by the model
     optional uint32 max_supported_total_tokens = 1;

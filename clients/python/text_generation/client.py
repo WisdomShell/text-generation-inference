@@ -3,13 +3,19 @@ import requests
 
 from aiohttp import ClientSession, ClientTimeout
 from pydantic import ValidationError
-from typing import Dict, Optional, List, AsyncIterator, Iterator
+from typing import Dict, Optional, List, AsyncIterator, Iterator, Union
 
 from text_generation.types import (
     StreamResponse,
     Response,
     Request,
     Parameters,
+    Grammar,
+    ChatRequest,
+    ChatCompletionChunk,
+    ChatComplete,
+    Message,
+    Tool,
 )
 from text_generation.errors import parse_error
 
@@ -58,6 +64,114 @@ class Client:
         self.cookies = cookies
         self.timeout = timeout
 
+    def chat(
+        self,
+        messages: List[Message],
+        frequency_penalty: Optional[float] = None,
+        logit_bias: Optional[List[float]] = None,
+        logprobs: Optional[bool] = None,
+        top_logprobs: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        n: Optional[int] = None,
+        presence_penalty: Optional[float] = None,
+        stream: bool = False,
+        seed: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        tools: Optional[List[Tool]] = None,
+        tool_choice: Optional[str] = None,
+    ):
+        """
+        Given a list of messages, generate a response asynchronously
+
+        Args:
+            messages (`List[Message]`):
+                List of messages
+            frequency_penalty (`float`):
+                The parameter for frequency penalty. 0.0 means no penalty. See [this
+                paper](https://arxiv.org/pdf/1909.05858.pdf) for more details.
+            logit_bias (`List[float]`):
+                Adjust the likelihood of specified tokens
+            logprobs (`bool`):
+                Include log probabilities in the response
+            top_logprobs (`int`):
+                Include the `n` most likely tokens at each step
+            max_tokens (`int`):
+                Maximum number of generated tokens
+            n (`int`):
+                Generate `n` completions
+            presence_penalty (`float`):
+                The parameter for presence penalty. 0.0 means no penalty. See [this
+                paper](https://arxiv.org/pdf/1909.05858.pdf) for more details.
+            stream (`bool`):
+                Stream the response
+            seed (`int`):
+                Random sampling seed
+            temperature (`float`):
+                The value used to module the logits distribution.
+            top_p (`float`):
+                If set to < 1, only the smallest set of most probable tokens with probabilities that add up to `top_p` or
+                higher are kept for generation
+            tools (`List[Tool]`):
+                List of tools to use
+            tool_choice (`str`):
+                The tool to use
+
+        """
+        request = ChatRequest(
+            model="tgi",
+            messages=messages,
+            frequency_penalty=frequency_penalty,
+            logit_bias=logit_bias,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
+            max_tokens=max_tokens,
+            n=n,
+            presence_penalty=presence_penalty,
+            stream=stream,
+            seed=seed,
+            temperature=temperature,
+            top_p=top_p,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        if not stream:
+            resp = requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=request.dict(),
+                headers=self.headers,
+                cookies=self.cookies,
+                timeout=self.timeout,
+            )
+            payload = resp.json()
+            if resp.status_code != 200:
+                raise parse_error(resp.status_code, payload)
+            return ChatComplete(**payload)
+        else:
+            return self._chat_stream_response(request)
+
+    def _chat_stream_response(self, request):
+        resp = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            json=request.dict(),
+            headers=self.headers,
+            cookies=self.cookies,
+            timeout=self.timeout,
+            stream=True,
+        )
+        # iterate and print stream
+        for byte_payload in resp.iter_lines():
+            if byte_payload == b"\n":
+                continue
+            payload = byte_payload.decode("utf-8")
+            if payload.startswith("data:"):
+                json_payload = json.loads(payload.lstrip("data:").rstrip("\n"))
+                try:
+                    response = ChatCompletionChunk(**json_payload)
+                    yield response
+                except ValidationError:
+                    raise parse_error(resp.status, json_payload)
+
     def generate(
         self,
         prompt: str,
@@ -76,6 +190,7 @@ class Client:
         watermark: bool = False,
         decoder_input_details: bool = False,
         top_n_tokens: Optional[int] = None,
+        grammar: Optional[Grammar] = None,
     ) -> Response:
         """
         Given a prompt, generate the following text
@@ -116,6 +231,9 @@ class Client:
                 Return the decoder input token logprobs and ids
             top_n_tokens (`int`):
                 Return the `n` most likely tokens at each step
+            grammar (`Grammar`):
+                Whether to use a grammar for the generation and the grammar to use. Grammars will constrain the generation
+                of the text to match a regular expression or JSON schema.
 
         Returns:
             Response: generated response
@@ -138,6 +256,7 @@ class Client:
             watermark=watermark,
             decoder_input_details=decoder_input_details,
             top_n_tokens=top_n_tokens,
+            grammar=grammar,
         )
         request = Request(inputs=prompt, stream=False, parameters=parameters)
 
@@ -169,6 +288,7 @@ class Client:
         typical_p: Optional[float] = None,
         watermark: bool = False,
         top_n_tokens: Optional[int] = None,
+        grammar: Optional[Grammar] = None,
     ) -> Iterator[StreamResponse]:
         """
         Given a prompt, generate the following stream of tokens
@@ -205,6 +325,9 @@ class Client:
                 Watermarking with [A Watermark for Large Language Models](https://arxiv.org/abs/2301.10226)
             top_n_tokens (`int`):
                 Return the `n` most likely tokens at each step
+            grammar (`Grammar`):
+                Whether to use a grammar for the generation and the grammar to use. Grammars will constrain the generation
+                of the text to match a regular expression or JSON schema.
 
         Returns:
             Iterator[StreamResponse]: stream of generated tokens
@@ -227,6 +350,7 @@ class Client:
             typical_p=typical_p,
             watermark=watermark,
             top_n_tokens=top_n_tokens,
+            grammar=grammar,
         )
         request = Request(inputs=prompt, stream=True, parameters=parameters)
 
@@ -306,7 +430,114 @@ class AsyncClient:
         self.base_url = base_url
         self.headers = headers
         self.cookies = cookies
-        self.timeout = ClientTimeout(timeout * 60)
+        self.timeout = ClientTimeout(timeout)
+
+    async def chat(
+        self,
+        messages: List[Message],
+        frequency_penalty: Optional[float] = None,
+        logit_bias: Optional[List[float]] = None,
+        logprobs: Optional[bool] = None,
+        top_logprobs: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        n: Optional[int] = None,
+        presence_penalty: Optional[float] = None,
+        stream: bool = False,
+        seed: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        tools: Optional[List[Tool]] = None,
+        tool_choice: Optional[str] = None,
+    ) -> Union[ChatComplete, AsyncIterator[ChatCompletionChunk]]:
+        """
+        Given a list of messages, generate a response asynchronously
+
+        Args:
+            messages (`List[Message]`):
+                List of messages
+            frequency_penalty (`float`):
+                The parameter for frequency penalty. 0.0 means no penalty. See [this
+                paper](https://arxiv.org/pdf/1909.05858.pdf) for more details.
+            logit_bias (`List[float]`):
+                Adjust the likelihood of specified tokens
+            logprobs (`bool`):
+                Include log probabilities in the response
+            top_logprobs (`int`):
+                Include the `n` most likely tokens at each step
+            max_tokens (`int`):
+                Maximum number of generated tokens
+            n (`int`):
+                Generate `n` completions
+            presence_penalty (`float`):
+                The parameter for presence penalty. 0.0 means no penalty. See [this
+                paper](https://arxiv.org/pdf/1909.05858.pdf) for more details.
+            stream (`bool`):
+                Stream the response
+            seed (`int`):
+                Random sampling seed
+            temperature (`float`):
+                The value used to module the logits distribution.
+            top_p (`float`):
+                If set to < 1, only the smallest set of most probable tokens with probabilities that add up to `top_p` or
+                higher are kept for generation
+            tools (`List[Tool]`):
+                List of tools to use
+            tool_choice (`str`):
+                The tool to use
+
+        """
+        request = ChatRequest(
+            model="tgi",
+            messages=messages,
+            frequency_penalty=frequency_penalty,
+            logit_bias=logit_bias,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
+            max_tokens=max_tokens,
+            n=n,
+            presence_penalty=presence_penalty,
+            stream=stream,
+            seed=seed,
+            temperature=temperature,
+            top_p=top_p,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        if not stream:
+            return await self._chat_single_response(request)
+        else:
+            return self._chat_stream_response(request)
+
+    async def _chat_single_response(self, request):
+        async with ClientSession(
+            headers=self.headers, cookies=self.cookies, timeout=self.timeout
+        ) as session:
+            async with session.post(
+                f"{self.base_url}/v1/chat/completions", json=request.dict()
+            ) as resp:
+                payload = await resp.json()
+                if resp.status != 200:
+                    raise parse_error(resp.status, payload)
+                return ChatComplete(**payload)
+
+    async def _chat_stream_response(self, request):
+        async with ClientSession(
+            headers=self.headers, cookies=self.cookies, timeout=self.timeout
+        ) as session:
+            async with session.post(
+                f"{self.base_url}/v1/chat/completions", json=request.dict()
+            ) as resp:
+                async for byte_payload in resp.content:
+                    if byte_payload == b"\n":
+                        continue
+                    payload = byte_payload.decode("utf-8")
+                    if payload.startswith("data:"):
+                        json_payload = json.loads(payload.lstrip("data:").rstrip("\n"))
+                        try:
+                            response = ChatCompletionChunk(**json_payload)
+                            yield response
+                        except ValidationError:
+                            raise parse_error(resp.status, json_payload)
 
     async def generate(
         self,
@@ -326,6 +557,7 @@ class AsyncClient:
         watermark: bool = False,
         decoder_input_details: bool = False,
         top_n_tokens: Optional[int] = None,
+        grammar: Optional[Grammar] = None,
     ) -> Response:
         """
         Given a prompt, generate the following text asynchronously
@@ -366,10 +598,14 @@ class AsyncClient:
                 Return the decoder input token logprobs and ids
             top_n_tokens (`int`):
                 Return the `n` most likely tokens at each step
+            grammar (`Grammar`):
+                Whether to use a grammar for the generation and the grammar to use. Grammars will constrain the generation
+                of the text to match a regular expression or JSON schema.
 
         Returns:
             Response: generated response
         """
+
         # Validate parameters
         parameters = Parameters(
             best_of=best_of,
@@ -388,6 +624,7 @@ class AsyncClient:
             typical_p=typical_p,
             watermark=watermark,
             top_n_tokens=top_n_tokens,
+            grammar=grammar,
         )
         request = Request(inputs=prompt, stream=False, parameters=parameters)
 
@@ -417,6 +654,7 @@ class AsyncClient:
         typical_p: Optional[float] = None,
         watermark: bool = False,
         top_n_tokens: Optional[int] = None,
+        grammar: Optional[Grammar] = None,
     ) -> AsyncIterator[StreamResponse]:
         """
         Given a prompt, generate the following stream of tokens asynchronously
@@ -453,6 +691,9 @@ class AsyncClient:
                 Watermarking with [A Watermark for Large Language Models](https://arxiv.org/abs/2301.10226)
             top_n_tokens (`int`):
                 Return the `n` most likely tokens at each step
+            grammar (`Grammar`):
+                Whether to use a grammar for the generation and the grammar to use. Grammars will constrain the generation
+                of the text to match a regular expression or JSON schema.
 
         Returns:
             AsyncIterator[StreamResponse]: stream of generated tokens
@@ -475,6 +716,7 @@ class AsyncClient:
             typical_p=typical_p,
             watermark=watermark,
             top_n_tokens=top_n_tokens,
+            grammar=grammar,
         )
         request = Request(inputs=prompt, stream=True, parameters=parameters)
 

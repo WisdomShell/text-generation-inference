@@ -114,7 +114,9 @@ class IdeficsCausalLMBatch(Batch):
         for i, r in enumerate(pb.requests):
             requests_idx_mapping[r.id] = i
             inputs.append(r.inputs)
-            next_token_choosers.append(NextTokenChooser.from_pb(r.parameters, device))
+            next_token_choosers.append(
+                NextTokenChooser.from_pb(r.parameters, device, tokenizer)
+            )
             stopping_criteria = StoppingCriteria.from_pb(
                 r.stopping_parameters, tokenizer
             )
@@ -401,9 +403,9 @@ class IdeficsCausalLMBatch(Batch):
                 pixel_values = batch.pixel_values.new_zeros(
                     (total_batch_size, max_num_images, 3, 224, 224)
                 )
-            pixel_values[
-                start_index:end_index, :curr_batch_max_num_images
-            ] = batch.pixel_values
+            pixel_values[start_index:end_index, :curr_batch_max_num_images] = (
+                batch.pixel_values
+            )
 
             if image_attention_mask is None:
                 image_attention_mask = batch.image_attention_mask.new_zeros(
@@ -500,14 +502,14 @@ class IdeficsCausalLMBatch(Batch):
                 # We slice the keys to remove the padding from previous batches
                 past_seq_len = batch.max_input_length - 1
                 if batch.keys_head_dim_last:
-                    padded_past_keys[
-                        start_index:end_index, :, -past_seq_len:, :
-                    ] = past_keys[:, :, -past_seq_len:, :]
+                    padded_past_keys[start_index:end_index, :, -past_seq_len:, :] = (
+                        past_keys[:, :, -past_seq_len:, :]
+                    )
                 else:
                     # BLOOM case
-                    padded_past_keys[
-                        start_index:end_index, :, :, -past_seq_len:
-                    ] = past_keys[:, :, :, -past_seq_len:]
+                    padded_past_keys[start_index:end_index, :, :, -past_seq_len:] = (
+                        past_keys[:, :, :, -past_seq_len:]
+                    )
                 del past_keys
 
                 start_index = end_index
@@ -525,9 +527,9 @@ class IdeficsCausalLMBatch(Batch):
                 end_index = start_index + len(batch)
                 # We slice the past values to remove the padding from previous batches
                 past_seq_len = batch.max_input_length - 1
-                padded_past_values[
-                    start_index:end_index, :, -past_seq_len:, :
-                ] = past_values[:, :, -past_seq_len:, :]
+                padded_past_values[start_index:end_index, :, -past_seq_len:, :] = (
+                    past_values[:, :, -past_seq_len:, :]
+                )
                 del past_values
 
                 # Update values
@@ -603,9 +605,11 @@ class IdeficsCausalLM(Model):
             model_id,
             revision=revision,
             torch_dtype=dtype,
-            device_map="auto"
-            if torch.cuda.is_available() and torch.cuda.device_count() > 1
-            else None,
+            device_map=(
+                "auto"
+                if torch.cuda.is_available() and torch.cuda.device_count() > 1
+                else None
+            ),
             load_in_8bit=quantize == "bitsandbytes",
             trust_remote_code=trust_remote_code,
         )
@@ -658,8 +662,13 @@ class IdeficsCausalLM(Model):
         if self.has_position_ids:
             kwargs["position_ids"] = position_ids
 
-        outputs = self.model.forward(**kwargs)
-        return outputs.logits, outputs.past_key_values, outputs.image_hidden_states
+        outputs, speculative_logits = self.model.forward(**kwargs)
+        return (
+            outputs.logits,
+            speculative_logits,
+            outputs.past_key_values,
+            outputs.image_hidden_states,
+        )
 
     @tracer.start_as_current_span("generate_token")
     def generate_token(
@@ -682,7 +691,7 @@ class IdeficsCausalLM(Model):
                 :, : -batch.padding_right_offset
             ]
 
-        logits, past, image_hidden_states = self.forward(
+        logits, speculative_logits, past, image_hidden_states = self.forward(
             input_ids=batch.input_ids,
             attention_mask=attention_mask,
             position_ids=batch.position_ids,
@@ -815,6 +824,9 @@ class IdeficsCausalLM(Model):
                 generations.append(generation)
 
             # Update values
+            batch.next_token_choosers[i] = batch.next_token_choosers[i].advance_grammar(
+                next_token_id_squeezed.item()
+            )
             batch.input_ids[i, 0] = next_token_id
             batch.all_input_ids[i] = all_input_ids
             batch.input_lengths[i] = new_input_length
@@ -833,9 +845,9 @@ class IdeficsCausalLM(Model):
 
         # Update attention_mask as we added a new token to input_ids
         batch.attention_mask[:, -batch.padding_right_offset] = 1
-        batch.image_attention_mask[
-            :, -batch.padding_right_offset, :
-        ] = batch.image_attention_mask[:, -(batch.padding_right_offset + 1), :]
+        batch.image_attention_mask[:, -batch.padding_right_offset, :] = (
+            batch.image_attention_mask[:, -(batch.padding_right_offset + 1), :]
+        )
         # Decrease right offset
         batch.padding_right_offset -= 1
 

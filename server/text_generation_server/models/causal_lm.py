@@ -87,7 +87,9 @@ class CausalLMBatch(Batch):
         for i, r in enumerate(pb.requests):
             requests_idx_mapping[r.id] = i
             inputs.append(r.inputs)
-            next_token_choosers.append(NextTokenChooser.from_pb(r.parameters, device))
+            next_token_choosers.append(
+                NextTokenChooser.from_pb(r.parameters, device, tokenizer)
+            )
             stopping_criteria = StoppingCriteria.from_pb(
                 r.stopping_parameters, tokenizer
             )
@@ -413,14 +415,14 @@ class CausalLMBatch(Batch):
                 # We slice the keys to remove the padding from previous batches
                 past_seq_len = batch.max_input_length - 1
                 if batch.keys_head_dim_last:
-                    padded_past_keys[
-                        start_index:end_index, :, -past_seq_len:, :
-                    ] = past_keys[:, :, -past_seq_len:, :]
+                    padded_past_keys[start_index:end_index, :, -past_seq_len:, :] = (
+                        past_keys[:, :, -past_seq_len:, :]
+                    )
                 else:
                     # BLOOM case
-                    padded_past_keys[
-                        start_index:end_index, :, :, -past_seq_len:
-                    ] = past_keys[:, :, :, -past_seq_len:]
+                    padded_past_keys[start_index:end_index, :, :, -past_seq_len:] = (
+                        past_keys[:, :, :, -past_seq_len:]
+                    )
                 del past_keys
 
                 start_index = end_index
@@ -438,9 +440,9 @@ class CausalLMBatch(Batch):
                 end_index = start_index + len(batch)
                 # We slice the past values to remove the padding from previous batches
                 past_seq_len = batch.max_input_length - 1
-                padded_past_values[
-                    start_index:end_index, :, -past_seq_len:, :
-                ] = past_values[:, :, -past_seq_len:, :]
+                padded_past_values[start_index:end_index, :, -past_seq_len:, :] = (
+                    past_values[:, :, -past_seq_len:, :]
+                )
                 del past_values
 
                 # Update values
@@ -480,9 +482,13 @@ class CausalLM(Model):
         model_id: str,
         revision: Optional[str] = None,
         quantize: Optional[str] = None,
+        use_medusa: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
     ):
+        if use_medusa:
+            raise RuntimeError("Medusa decoding is not enabled for AutoModel")
+
         if torch.cuda.is_available():
             device = torch.device("cuda")
             dtype = torch.float16 if dtype is None else dtype
@@ -504,9 +510,11 @@ class CausalLM(Model):
             model_id,
             revision=revision,
             torch_dtype=dtype,
-            device_map="auto"
-            if torch.cuda.is_available() and torch.cuda.device_count() > 1
-            else None,
+            device_map=(
+                "auto"
+                if torch.cuda.is_available() and torch.cuda.device_count() > 1
+                else None
+            ),
             load_in_8bit=quantize == "bitsandbytes",
             trust_remote_code=trust_remote_code,
         )
@@ -546,7 +554,9 @@ class CausalLM(Model):
 
     def forward(
         self, input_ids, attention_mask, position_ids, past_key_values: Optional = None
-    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[
+        torch.Tensor, Optional[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]
+    ]:
         # Model Forward
         kwargs = {
             "input_ids": input_ids,
@@ -559,7 +569,11 @@ class CausalLM(Model):
             kwargs["position_ids"] = position_ids
 
         outputs = self.model.forward(**kwargs)
-        return outputs.logits, outputs.past_key_values
+        if isinstance(outputs, tuple):
+            outputs, speculative_logits = outputs
+        else:
+            speculative_logits = None
+        return outputs.logits, speculative_logits, outputs.past_key_values
 
     @tracer.start_as_current_span("generate_token")
     def generate_token(
@@ -569,7 +583,7 @@ class CausalLM(Model):
         # slice the attention mask to the correct shape
         attention_mask = batch.attention_mask[:, : -batch.padding_right_offset]
 
-        logits, past = self.forward(
+        logits, speculative_logits, past = self.forward(
             batch.input_ids,
             attention_mask,
             batch.position_ids,
@@ -696,14 +710,17 @@ class CausalLM(Model):
 
                 if top_n_tokens > 0:
                     all_top_tokens = []
-                    for (top_token_ids, top_token_logprobs) in zip(top_token_ids, top_token_logprobs):
+                    for top_token_ids, top_token_logprobs in zip(
+                        top_token_ids, top_token_logprobs
+                    ):
                         toptoken_texts = self.tokenizer.batch_decode(
                             top_token_ids,
                             clean_up_tokenization_spaces=False,
                             skip_special_tokens=False,
                         )
                         special_toptokens = [
-                            token_id in self.all_special_ids for token_id in top_token_ids
+                            token_id in self.all_special_ids
+                            for token_id in top_token_ids
                         ]
                         top_tokens = Tokens(
                             top_token_ids,
@@ -732,6 +749,9 @@ class CausalLM(Model):
                 generations.append(generation)
 
             # Update values
+            batch.next_token_choosers[i] = batch.next_token_choosers[i].advance_grammar(
+                next_token_id_squeezed.item()
+            )
             batch.input_ids[i, 0] = next_token_id
             batch.all_input_ids[i] = all_input_ids
             batch.input_lengths[i] = new_input_length

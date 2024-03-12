@@ -1,5 +1,5 @@
 <div align="center">
-  
+
 <a href="https://www.youtube.com/watch?v=jlMAX2Oaht0">
   <img width=560 width=315 alt="Making TGI deployment optimal" src="https://huggingface.co/datasets/Narsil/tgi_assets/resolve/main/thumbnail.png">
 </a>
@@ -20,19 +20,23 @@ to power Hugging Chat, the Inference API and Inference Endpoint.
 
 ## Table of contents
 
-- [Get Started](#get-started)
-  - [API Documentation](#api-documentation)
-  - [Using a private or gated model](#using-a-private-or-gated-model)
-  - [A note on Shared Memory](#a-note-on-shared-memory-shm)
-  - [Distributed Tracing](#distributed-tracing)
-  - [Local Install](#local-install)
-  - [CUDA Kernels](#cuda-kernels)
-- [Optimized architectures](#optimized-architectures)
-- [Run Falcon](#run-falcon)
-  - [Run](#run)
-  - [Quantization](#quantization)
-- [Develop](#develop)
-- [Testing](#testing)
+- [Text Generation Inference](#text-generation-inference)
+  - [Table of contents](#table-of-contents)
+    - [Hardware support](#hardware-support)
+  - [Get Started](#get-started)
+    - [Docker](#docker)
+    - [API documentation](#api-documentation)
+    - [Using a private or gated model](#using-a-private-or-gated-model)
+    - [A note on Shared Memory (shm)](#a-note-on-shared-memory-shm)
+    - [Distributed Tracing](#distributed-tracing)
+    - [Architecture](#architecture)
+    - [Local install](#local-install)
+    - [CUDA Kernels](#cuda-kernels)
+  - [Run CodeShell](#run-codeshell)
+    - [Run](#run)
+    - [Quantization](#quantization)
+  - [Develop](#develop)
+  - [Testing](#testing)
 
 Text Generation Inference (TGI) is a toolkit for deploying and serving Large Language Models (LLMs). TGI enables high-performance text generation for the most popular open-source LLMs, including Llama, Falcon, StarCoder, BLOOM, GPT-NeoX, and [more](https://huggingface.co/docs/text-generation-inference/supported_models). TGI implements many features, such as:
 
@@ -42,40 +46,28 @@ Text Generation Inference (TGI) is a toolkit for deploying and serving Large Lan
 - Token streaming using Server-Sent Events (SSE)
 - Continuous batching of incoming requests for increased total throughput
 - Optimized transformers code for inference using [Flash Attention](https://github.com/HazyResearch/flash-attention) and [Paged Attention](https://github.com/vllm-project/vllm) on the most popular architectures
-- Quantization with [bitsandbytes](https://github.com/TimDettmers/bitsandbytes) and [GPT-Q](https://arxiv.org/abs/2210.17323)
+- Quantization with :
+  - [bitsandbytes](https://github.com/TimDettmers/bitsandbytes)
+  - [GPT-Q](https://arxiv.org/abs/2210.17323)
+  - [EETQ](https://github.com/NetEase-FuXi/EETQ)
+  - [AWQ](https://github.com/casper-hansen/AutoAWQ)
 - [Safetensors](https://github.com/huggingface/safetensors) weight loading
 - Watermarking with [A Watermark for Large Language Models](https://arxiv.org/abs/2301.10226)
 - Logits warper (temperature scaling, top-p, top-k, repetition penalty, more details see [transformers.LogitsProcessor](https://huggingface.co/docs/transformers/internal/generation_utils#transformers.LogitsProcessor))
 - Stop sequences
 - Log probabilities
-- Production ready (distributed tracing with Open Telemetry, Prometheus metrics)
-- Custom Prompt Generation: Easily generate text by providing custom prompts to guide the model's output.
-- Fine-tuning Support: Utilize fine-tuned models for specific tasks to achieve higher accuracy and performance.
+- [Speculation](https://huggingface.co/docs/text-generation-inference/conceptual/speculation) ~2x latency
+- [Guidance/JSON](https://huggingface.co/docs/text-generation-inference/conceptual/guidance). Specify output format to speed up inference and make sure the output is valid according to some specs..
+- Custom Prompt Generation: Easily generate text by providing custom prompts to guide the model's output
+- Fine-tuning Support: Utilize fine-tuned models for specific tasks to achieve higher accuracy and performance
 
+### Hardware support
 
-## Optimized architectures
-
-- [BLOOM](https://huggingface.co/bigscience/bloom)
-- [FLAN-T5](https://huggingface.co/google/flan-t5-xxl)
-- [Galactica](https://huggingface.co/facebook/galactica-120b)
-- [GPT-Neox](https://huggingface.co/EleutherAI/gpt-neox-20b)
-- [Llama](https://github.com/facebookresearch/llama)
-- [OPT](https://huggingface.co/facebook/opt-66b)
-- [SantaCoder](https://huggingface.co/bigcode/santacoder)
-- [Starcoder](https://huggingface.co/bigcode/starcoder)
-- [Falcon 7B](https://huggingface.co/tiiuae/falcon-7b)
-- [Falcon 40B](https://huggingface.co/tiiuae/falcon-40b)
-- [MPT](https://huggingface.co/mosaicml/mpt-30b)
-- [Llama V2](https://huggingface.co/meta-llama)
-- [Code Llama](https://huggingface.co/codellama)
-- [Mistral](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1)
-- [CodeShell](https://huggingface.co/WisdomShell/CodeShell-7B)
-
-Other architectures are supported on a best effort basis using:
-
-`AutoModelForCausalLM.from_pretrained(<model>, device_map="auto")`
-
-or
+- [Nvidia](https://github.com/huggingface/text-generation-inference/pkgs/container/text-generation-inference)
+- [AMD](https://github.com/huggingface/text-generation-inference/pkgs/container/text-generation-inference) (-rocm)
+- [Inferentia](https://github.com/huggingface/optimum-neuron/tree/main/text-generation-inference)
+- [Intel GPU](https://github.com/huggingface/text-generation-inference/pull/1475)
+- [Gaudi](https://github.com/huggingface/tgi-gaudi)
 
 
 ## Get Started
@@ -186,7 +178,7 @@ Python 3.9, e.g. using `conda`:
 ```shell
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-conda create -n text-generation-inference python=3.9
+conda create -n text-generation-inference python=3.11
 conda activate text-generation-inference
 ```
 

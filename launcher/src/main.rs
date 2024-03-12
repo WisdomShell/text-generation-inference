@@ -279,6 +279,15 @@ struct Args {
     #[clap(default_value = "20", long, env)]
     max_waiting_tokens: usize,
 
+    /// Enforce a maximum number of requests per batch
+    /// Specific flag for hardware targets that do not support unpadded inference
+    #[clap(long, env)]
+    max_batch_size: Option<usize>,
+
+    /// Enable experimental support for cuda graphs
+    #[clap(long, env)]
+    enable_cuda_graphs: bool,
+
     /// The IP address to listen on
     #[clap(default_value = "0.0.0.0", long, env)]
     hostname: String,
@@ -373,6 +382,11 @@ struct Args {
     #[clap(long, env)]
     tokenizer_config_path: Option<String>,
 
+    /// Disable outlines grammar constrained generation.
+    /// This is a feature that allows you to generate text that follows a specific grammar.
+    #[clap(long, env)]
+    disable_grammar_support: bool,
+
     /// Display a lot of information about your runtime environment
     #[clap(long, short, action)]
     env: bool,
@@ -402,6 +416,7 @@ fn shard_manager(
     disable_custom_kernels: bool,
     watermark_gamma: Option<f32>,
     watermark_delta: Option<f32>,
+    enable_cuda_graphs: bool,
     cuda_memory_fraction: f32,
     rope_scaling: Option<RopeScaling>,
     rope_factor: Option<f32>,
@@ -483,7 +498,7 @@ fn shard_manager(
     envs.push(("WORLD_SIZE".into(), world_size.to_string().into()));
     envs.push(("MASTER_ADDR".into(), master_addr.into()));
     envs.push(("MASTER_PORT".into(), master_port.to_string().into()));
-    envs.push(("NCCL_ASYNC_ERROR_HANDLING".into(), "1".into()));
+    envs.push(("TORCH_NCCL_AVOID_RECORD_STREAMS".into(), "1".into()));
 
     // CUDA memory fraction
     envs.push((
@@ -532,6 +547,11 @@ fn shard_manager(
             weights_cache_override.into(),
         ));
     };
+
+    // Enable experimental support for cuda graphs
+    if enable_cuda_graphs {
+        envs.push(("ENABLE_CUDA_GRAPHS".into(), "True".into()))
+    }
 
     // If disable_custom_kernels is true, pass it to the shard as an env var
     if disable_custom_kernels {
@@ -921,6 +941,7 @@ fn spawn_shards(
         let disable_custom_kernels = args.disable_custom_kernels;
         let watermark_gamma = args.watermark_gamma;
         let watermark_delta = args.watermark_delta;
+        let enable_cuda_graphs = args.enable_cuda_graphs;
         let cuda_memory_fraction = args.cuda_memory_fraction;
         let rope_scaling = args.rope_scaling;
         let rope_factor = args.rope_factor;
@@ -942,6 +963,7 @@ fn spawn_shards(
                 disable_custom_kernels,
                 watermark_gamma,
                 watermark_delta,
+                enable_cuda_graphs,
                 cuda_memory_fraction,
                 rope_scaling,
                 rope_factor,
@@ -982,7 +1004,20 @@ fn spawn_shards(
     Ok(())
 }
 
+fn compute_type(num_shard: usize) -> Option<String> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=gpu_name", "--format=csv"])
+        .output()
+        .ok()?;
+    let output = String::from_utf8(output.stdout).ok()?;
+    let fullname = output.split('\n').nth(1)?;
+    let cardname = fullname.replace(' ', "-").to_lowercase();
+    let compute_type = format!("{num_shard}-{cardname}");
+    Some(compute_type)
+}
+
 fn spawn_webserver(
+    num_shard: usize,
     args: Args,
     shutdown: Arc<AtomicBool>,
     shutdown_receiver: &mpsc::Receiver<()>,
@@ -1021,6 +1056,11 @@ fn spawn_webserver(
         args.model_id,
     ];
 
+    // Grammar support
+    if args.disable_grammar_support {
+        router_args.push("--disable-grammar-support".to_string());
+    }
+
     // Tokenizer config path
     if let Some(ref tokenizer_config_path) = args.tokenizer_config_path {
         router_args.push("--tokenizer-config-path".to_string());
@@ -1031,6 +1071,12 @@ fn spawn_webserver(
     if let Some(max_batch_total_tokens) = args.max_batch_total_tokens {
         router_args.push("--max-batch-total-tokens".to_string());
         router_args.push(max_batch_total_tokens.to_string());
+    }
+
+    // Router optional max batch size
+    if let Some(max_batch_size) = args.max_batch_size {
+        router_args.push("--max-batch-size".to_string());
+        router_args.push(max_batch_size.to_string());
     }
 
     // Model optional revision
@@ -1071,6 +1117,13 @@ fn spawn_webserver(
     if let Ok(api_token) = env::var("HF_API_TOKEN") {
         envs.push(("HUGGING_FACE_HUB_TOKEN".into(), api_token.into()))
     };
+
+    // Parse Compute type
+    if let Ok(compute_type) = env::var("COMPUTE_TYPE") {
+        envs.push(("COMPUTE_TYPE".into(), compute_type.into()))
+    } else if let Some(compute_type) = compute_type(num_shard) {
+        envs.push(("COMPUTE_TYPE".into(), compute_type.into()))
+    }
 
     let mut webserver = match Command::new("text-generation-router")
         .args(router_args)
@@ -1265,8 +1318,8 @@ fn main() -> Result<(), LauncherError> {
         return Ok(());
     }
 
-    let mut webserver =
-        spawn_webserver(args, shutdown.clone(), &shutdown_receiver).map_err(|err| {
+    let mut webserver = spawn_webserver(num_shard, args, shutdown.clone(), &shutdown_receiver)
+        .map_err(|err| {
             shutdown_shards(shutdown.clone(), &shutdown_receiver);
             err
         })?;

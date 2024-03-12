@@ -1,16 +1,21 @@
 import re
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
+import math
 import torch
 from text_generation_server.pb import generate_pb2
-from text_generation_server.pb.generate_pb2 import FinishReason
+from text_generation_server.pb.generate_pb2 import FinishReason, GrammarType
 from text_generation_server.utils.logits_process import (
+    FrequencyPenaltyLogitsProcessor,
+    GrammarLogitProcessor,
     HeterogeneousProcessorWrapper,
     HeterogeneousRepetitionPenaltyLogitsProcessor,
+    HeterogeneousFrequencyPenaltyLogitsProcessor,
     HeterogeneousTemperatureLogitsWarper,
     HeterogeneousTopKLogitsWarper,
     HeterogeneousTopPLogitsWarper,
     HeterogeneousTypicalLogitsWarper,
+    HeterogeneousGrammarLogitProcessor,
     static_warper,
 )
 from text_generation_server.utils.watermark import WatermarkLogitsProcessor
@@ -20,24 +25,40 @@ from transformers import PreTrainedTokenizerBase, RepetitionPenaltyLogitsProcess
 class NextTokenChooser:
     def __init__(
         self,
-        watermark=False,
-        temperature=1.0,
-        repetition_penalty=1.0,
-        top_k=None,
-        top_p=None,
-        typical_p=None,
-        do_sample=False,
-        seed=0,
-        device="cpu",
+        watermark: bool = False,
+        temperature: float = 1.0,
+        repetition_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        typical_p: Optional[float] = None,
+        do_sample: bool = False,
+        seed: int = 0,
+        device: str = "cpu",
+        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        grammar: str = "",
+        grammar_type: GrammarType = GrammarType.GRAMMAR_TYPE_NONE,
+        fsm_grammar_state: int = 0,
     ):
         self.watermark_processor = (
             WatermarkLogitsProcessor(device=device) if watermark else None
         )
         self.repetition_processor = (
             RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
-            if repetition_penalty
+            if repetition_penalty and repetition_penalty != 1.0
             else None
         )
+        self.frequency_processor = (
+            FrequencyPenaltyLogitsProcessor(penalty=frequency_penalty)
+            if frequency_penalty and frequency_penalty != 0.0
+            else None
+        )
+        self.grammar_processor = (
+            GrammarLogitProcessor(tokenizer, device, grammar, grammar_type)
+            if grammar != ""
+            else None
+        )
+        self.tokenizer = tokenizer
 
         has_warpers = (
             (temperature is not None and temperature != 1.0)
@@ -53,13 +74,20 @@ class NextTokenChooser:
             self.static_warper = None
 
         sampling = do_sample or has_warpers
+
         self.choice = Sampling(seed, device) if sampling else Greedy()
+        self.fsm_grammar_state = fsm_grammar_state
+        self.grammar = grammar
 
     def __call__(self, input_ids, scores):
         if self.watermark_processor is not None:
             scores = self.watermark_processor(input_ids, scores)
         if self.repetition_processor is not None:
             scores = self.repetition_processor(input_ids, scores)
+        if self.frequency_processor is not None:
+            scores = self.frequency_processor(input_ids, scores)
+        if self.grammar_processor is not None:
+            scores = self.grammar_processor(scores, self.fsm_grammar_state)
 
         if self.static_warper is None:
             next_logprob = torch.log_softmax(scores, -1)
@@ -70,22 +98,34 @@ class NextTokenChooser:
 
         return next_id, next_logprob
 
+    def advance_grammar(self, next_id: int):
+        if self.grammar_processor is not None:
+            self.fsm_grammar_state = self.grammar_processor.advance(
+                next_id, self.fsm_grammar_state
+            )
+        return self
+
     @classmethod
     def from_pb(
         cls,
         pb: generate_pb2.NextTokenChooserParameters,
         device: torch.device,
+        tokenizer: PreTrainedTokenizerBase,
     ) -> "NextTokenChooser":
         return NextTokenChooser(
             watermark=pb.watermark,
             temperature=pb.temperature,
             repetition_penalty=pb.repetition_penalty,
+            frequency_penalty=pb.frequency_penalty,
             top_k=pb.top_k,
             top_p=pb.top_p,
             typical_p=pb.typical_p,
             do_sample=pb.do_sample,
             seed=pb.seed,
             device=device,
+            tokenizer=tokenizer,
+            grammar=pb.grammar,
+            grammar_type=pb.grammar_type,
         )
 
 
@@ -184,11 +224,16 @@ class HeterogeneousNextTokenChooser:
         watermark: List[bool],
         temperature: List[float],
         repetition_penalty: List[float],
+        frequency_penalty: List[float],
         top_k: List[int],
         top_p: List[float],
         typical_p: List[float],
         do_sample: List[bool],
         seeds: List[int],
+        tokenizer: PreTrainedTokenizerBase,
+        grammars: List[str],
+        grammar_types: List[int],
+        fsm_grammar_states=List[int],
     ):
         warpers = []
 
@@ -209,6 +254,22 @@ class HeterogeneousNextTokenChooser:
                 repetition_penalty, dtype, device
             )
             if any([x != 1.0 for x in repetition_penalty])
+            else None
+        )
+
+        self.frequency_processor = (
+            HeterogeneousFrequencyPenaltyLogitsProcessor(
+                frequency_penalty, dtype, device
+            )
+            if any([x != 0.0 for x in frequency_penalty])
+            else None
+        )
+
+        self.grammar_processor = (
+            HeterogeneousGrammarLogitProcessor(
+                tokenizer, device, grammars, grammar_types
+            )
+            if any([grammar != "" for grammar in grammars])
             else None
         )
 
@@ -243,6 +304,10 @@ class HeterogeneousNextTokenChooser:
         self.do_sample = do_sample
         self.dtype = dtype
         self.device = device
+        self.tokenizer = tokenizer
+        self.fsm_grammar_states = fsm_grammar_states
+        self.grammars = grammars
+        self.grammar_types = grammar_types
 
     def __call__(
         self,
@@ -263,16 +328,19 @@ class HeterogeneousNextTokenChooser:
             scores = scores.view(B, S, -1)
 
         next_ids = torch.zeros((B, S), device=scores.device, dtype=torch.long)
+
         for j in range(S):
             _scores = scores[:, j]
             if self.watermark_processor is not None:
                 _scores = self.watermark_processor(input_ids, _scores)
             if self.repetition_processor is not None:
                 _scores = self.repetition_processor(input_ids, _scores)
-
+            if self.frequency_processor is not None:
+                _scores = self.frequency_processor(input_ids, _scores)
+            if self.grammar_processor is not None:
+                _scores = self.grammar_processor(_scores, self.fsm_grammar_states)
             for warper in self.warpers:
                 _scores = warper(input_ids, _scores)
-
             _next_ids = self.choice(_scores)
             scores[:, j] = _scores
             next_ids[:, j] = _next_ids
@@ -316,7 +384,6 @@ class HeterogeneousNextTokenChooser:
 
         next_logprobs = torch.gather(logprobs, 1, next_ids.view(-1, 1)).view(-1)
 
-
         if speculate > 0:
             if speculative_scores is not None:
                 # Medusa provided some scores
@@ -331,12 +398,37 @@ class HeterogeneousNextTokenChooser:
 
         return next_ids, next_logprobs, alllogprobs, accepted_ids, speculative_ids
 
+    def advance_grammar(self, next_ids: List[int]):
+        if self.grammar_processor is not None:
+            other_new_states = self.grammar_processor.advance_batch(
+                next_ids, self.fsm_grammar_states
+            )
+            self.fsm_grammar_states = other_new_states
+        return self
+
+    def advance_grammar_single(self, grammar_state_index: int, next_id: int):
+        if self.grammar_processor is not None:
+            self.fsm_grammar_states[grammar_state_index] = (
+                self.grammar_processor.advance_at_index(
+                    next_id,
+                    self.fsm_grammar_states[grammar_state_index],
+                    grammar_state_index,
+                )
+            )
+        return self
+
     def filter(self, indices):
         if self.watermark_processor is not None:
             self.watermark_processor = self.watermark_processor.filter(indices)
 
         if self.repetition_processor is not None:
             self.repetition_processor = self.repetition_processor.filter(indices)
+
+        if self.frequency_processor is not None:
+            self.frequency_processor = self.frequency_processor.filter(indices)
+
+        if self.grammar_processor is not None:
+            self.grammar_processor = self.grammar_processor.filter(indices)
 
         filtered_warpers = []
         for warper in self.warpers:
@@ -347,6 +439,18 @@ class HeterogeneousNextTokenChooser:
 
         self.seeds = [self.seeds[i] for i in indices]
         self.do_sample = [self.do_sample[i] for i in indices]
+
+        new_grammars = []
+        new_fsm_grammar_states = []
+        new_grammar_types = []
+        for i in indices:
+            new_grammars.append(self.grammars[i])
+            new_fsm_grammar_states.append(self.fsm_grammar_states[i])
+            new_grammar_types.append(self.grammar_types[i])
+
+        self.grammars = new_grammars
+        self.fsm_grammar_states = new_fsm_grammar_states
+        self.grammar_types = new_grammar_types
 
         if any(self.do_sample):
             self.choice.filter(indices)
@@ -361,11 +465,14 @@ class HeterogeneousNextTokenChooser:
         pb: List[generate_pb2.NextTokenChooserParameters],
         dtype: torch.dtype,
         device: torch.device,
+        tokenizer: PreTrainedTokenizerBase,
+        fsm_grammar_states: Optional[List[int]] = None,
     ) -> "HeterogeneousNextTokenChooser":
         return HeterogeneousNextTokenChooser(
             watermark=[pb_.watermark for pb_ in pb],
             temperature=[pb_.temperature for pb_ in pb],
             repetition_penalty=[pb_.repetition_penalty for pb_ in pb],
+            frequency_penalty=[pb_.frequency_penalty for pb_ in pb],
             top_k=[pb_.top_k for pb_ in pb],
             top_p=[pb_.top_p for pb_ in pb],
             typical_p=[pb_.typical_p for pb_ in pb],
@@ -373,6 +480,12 @@ class HeterogeneousNextTokenChooser:
             seeds=[pb_.seed for pb_ in pb],
             device=device,
             dtype=dtype,
+            tokenizer=tokenizer,
+            grammars=[pb_.grammar for pb_ in pb],
+            grammar_types=[pb_.grammar_type for pb_ in pb],
+            fsm_grammar_states=(
+                fsm_grammar_states if fsm_grammar_states else [0] * len(pb)
+            ),
         )
 
 
@@ -438,7 +551,10 @@ class HeterogeneousSampling:
 
 
 def batch_top_tokens(
-    top_n_tokens: List[int], top_n_tokens_tensor: torch.Tensor, logprobs: torch.Tensor, accepted_ids: torch.Tensor
+    top_n_tokens: List[int],
+    top_n_tokens_tensor: torch.Tensor,
+    logprobs: torch.Tensor,
+    accepted_ids: torch.Tensor,
 ) -> Tuple[List[List[List[int]]], List[List[List[float]]]]:
     """Find the top n most likely tokens for a batch of generations.
 
@@ -450,12 +566,15 @@ def batch_top_tokens(
     if max_top_n == 0:
         return [[[]]] * len(top_n_tokens), [[[]]] * len(top_n_tokens)
 
-
     batch_size = accepted_ids.shape[0]
     speculate_size = logprobs.shape[0] // batch_size
     top_n_tokens_tensor = top_n_tokens_tensor.repeat_interleave(speculate_size)
     # Ensure top_n doesn't exceed vocab size
-    top_n_tokens = [min(tok, logprobs.size(-1)) for tok in top_n_tokens for _ in range(speculate_size)]
+    top_n_tokens = [
+        min(tok, logprobs.size(-1))
+        for tok in top_n_tokens
+        for _ in range(speculate_size)
+    ]
 
     # Parallel kthvalue adapted from https://discuss.pytorch.org/t/how-to-efficiently-get-the-k-th-largest-values-in-parallel/160529/2
     # Sorted topk is faster than torch.sort() since we only need a small subset
@@ -484,10 +603,10 @@ def batch_top_tokens(
     for i, n_accepted_ids in enumerate(accepted_ids_list):
         start = speculate_size * i
         stop = speculate_size * (i + 1)
-        _top_indices = top_indices[start: stop]
-        _top_values = top_values[start: stop]
-        _top_n_ishes = top_n_ishes[start: stop]
-        _top_n_tokens = top_n_tokens[start: stop]
+        _top_indices = top_indices[start:stop]
+        _top_values = top_values[start:stop]
+        _top_n_ishes = top_n_ishes[start:stop]
+        _top_n_tokens = top_n_tokens[start:stop]
 
         _top_indices = _top_indices[:n_accepted_ids]
         _top_values = _top_values[:n_accepted_ids]
@@ -497,7 +616,9 @@ def batch_top_tokens(
         row_top_token_ids = []
         row_top_token_logprobs = []
 
-        for idxs, vals, n, req_n in zip(_top_indices, _top_values, _top_n_ishes, _top_n_tokens):
+        for idxs, vals, n, req_n in zip(
+            _top_indices, _top_values, _top_n_ishes, _top_n_tokens
+        ):
             indices = idxs[:n] if req_n > 0 else []
             values = vals[:n] if req_n > 0 else []
 

@@ -1,8 +1,12 @@
 /// Payload validation logic
 use crate::validation::ValidationError::{BestOfSampling, BestOfSeed, EmptyInput};
-use crate::{GenerateParameters, GenerateRequest};
+use crate::{GenerateParameters, GenerateRequest, GrammarType};
+use jsonschema::{Draft, JSONSchema};
 use rand::{thread_rng, Rng};
-use text_generation_client::{NextTokenChooserParameters, StoppingCriteriaParameters};
+use serde_json::Value;
+use text_generation_client::{
+    GrammarType as ProtoGrammarType, NextTokenChooserParameters, StoppingCriteriaParameters,
+};
 use thiserror::Error;
 use tokenizers::tokenizer::Tokenizer;
 use tokenizers::TruncationDirection;
@@ -19,11 +23,13 @@ pub struct Validation {
     max_top_n_tokens: u32,
     max_input_length: usize,
     max_total_tokens: usize,
+    disable_grammar_support: bool,
     /// Channel to communicate with the background tokenization task
     sender: Option<mpsc::UnboundedSender<TokenizerRequest>>,
 }
 
 impl Validation {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         workers: usize,
         tokenizer: Option<Tokenizer>,
@@ -32,6 +38,7 @@ impl Validation {
         max_top_n_tokens: u32,
         max_input_length: usize,
         max_total_tokens: usize,
+        disable_grammar_support: bool,
     ) -> Self {
         // If we have a fast tokenizer
         let sender = if let Some(tokenizer) = tokenizer {
@@ -66,6 +73,7 @@ impl Validation {
             max_top_n_tokens,
             max_input_length,
             max_total_tokens,
+            disable_grammar_support,
         }
     }
 
@@ -170,6 +178,7 @@ impl Validation {
             best_of,
             temperature,
             repetition_penalty,
+            frequency_penalty,
             top_k,
             top_p,
             typical_p,
@@ -181,6 +190,7 @@ impl Validation {
             watermark,
             decoder_input_details,
             top_n_tokens,
+            grammar,
             ..
         } = request.parameters;
 
@@ -204,6 +214,11 @@ impl Validation {
         let repetition_penalty = repetition_penalty.unwrap_or(1.0);
         if repetition_penalty <= 0.0 {
             return Err(ValidationError::RepetitionPenalty);
+        }
+
+        let frequency_penalty = frequency_penalty.unwrap_or(0.0);
+        if !(-2.0..=2.0).contains(&frequency_penalty) {
+            return Err(ValidationError::FrequencyPenalty);
         }
 
         // Different because the proto default value is not a valid value
@@ -286,15 +301,61 @@ impl Validation {
             .validate_input(request.inputs, truncate, max_new_tokens)
             .await?;
 
+        // TODO: we should build the FSM here and pass the compiled FSM instead of the grammar
+        // NOTE: this is currently difficult because we need the tokenizer in Python to build
+        // the FSM and we'd have to load a copy of the tokenizer into our Pyo3 instance which
+        // may be slow and memory intensive. Best case is to have a Rust implementation of the FSM
+        // compiler and use that to build the FSM here.
+
+        // Validate grammar and unpack the grammar and type for the proto message
+        let (grammar, grammar_type) = match grammar {
+            Some(grammar) => {
+                // Ensure that grammar is not set if it's not supported
+                if self.disable_grammar_support {
+                    return Err(ValidationError::Grammar);
+                }
+                match grammar {
+                    GrammarType::Json(json) => {
+                        let json = match json {
+                            // if value is a string, we need to parse it again to make sure its
+                            // a valid json
+                            Value::String(s) => serde_json::from_str(&s)
+                                .map_err(|e| ValidationError::InvalidGrammar(e.to_string())),
+                            Value::Object(_) => Ok(json),
+                            _ => Err(ValidationError::Grammar),
+                        }?;
+
+                        // Check if the json is a valid JSONSchema
+                        JSONSchema::options()
+                            .with_draft(Draft::Draft202012)
+                            .compile(&json)
+                            .map_err(|e| ValidationError::InvalidGrammar(e.to_string()))?;
+
+                        (
+                            // Serialize json to string
+                            serde_json::to_string(&json)
+                                .map_err(|e| ValidationError::InvalidGrammar(e.to_string()))?,
+                            ProtoGrammarType::Json.into(),
+                        )
+                    }
+                    GrammarType::Regex(regex) => (regex, ProtoGrammarType::Regex.into()),
+                }
+            }
+            None => (String::new(), ProtoGrammarType::None.into()),
+        };
+
         let parameters = NextTokenChooserParameters {
             temperature,
             repetition_penalty,
+            frequency_penalty,
             top_k,
             top_p,
             typical_p,
             do_sample,
             seed,
             watermark,
+            grammar,
+            grammar_type,
         };
         let stopping_parameters = StoppingCriteriaParameters {
             max_new_tokens,
@@ -420,6 +481,8 @@ pub enum ValidationError {
     Temperature,
     #[error("`repetition_penalty` must be strictly positive")]
     RepetitionPenalty,
+    #[error("`frequency_penalty` must be >= -2.0 and <= 2.0")]
+    FrequencyPenalty,
     #[error("`top_p` must be > 0.0 and < 1.0")]
     TopP,
     #[error("`top_k` must be strictly positive")]
@@ -444,6 +507,10 @@ pub enum ValidationError {
     StopSequence(usize, usize),
     #[error("tokenizer error {0}")]
     Tokenizer(String),
+    #[error("grammar is not supported")]
+    Grammar,
+    #[error("grammar is not valid: {0}")]
+    InvalidGrammar(String),
 }
 
 #[cfg(test)]
@@ -461,6 +528,7 @@ mod tests {
         let max_input_length = 5;
         let max_total_tokens = 6;
         let workers = 1;
+        let disable_grammar_support = true;
         let validation = Validation::new(
             workers,
             tokenizer,
@@ -469,6 +537,7 @@ mod tests {
             max_top_n_tokens,
             max_input_length,
             max_total_tokens,
+            disable_grammar_support,
         );
 
         let max_new_tokens = 10;
@@ -489,6 +558,7 @@ mod tests {
         let max_top_n_tokens = 4;
         let max_input_length = 5;
         let max_total_tokens = 6;
+        let disable_grammar_support = true;
         let workers = 1;
         let validation = Validation::new(
             workers,
@@ -498,6 +568,7 @@ mod tests {
             max_top_n_tokens,
             max_input_length,
             max_total_tokens,
+            disable_grammar_support,
         );
 
         let max_new_tokens = 10;
@@ -519,6 +590,7 @@ mod tests {
         let max_input_length = 5;
         let max_total_tokens = 6;
         let workers = 1;
+        let disable_grammar_support = true;
         let validation = Validation::new(
             workers,
             tokenizer,
@@ -527,6 +599,7 @@ mod tests {
             max_top_n_tokens,
             max_input_length,
             max_total_tokens,
+            disable_grammar_support,
         );
         match validation
             .validate(GenerateRequest {
@@ -553,6 +626,7 @@ mod tests {
         let max_input_length = 5;
         let max_total_tokens = 106;
         let workers = 1;
+        let disable_grammar_support = true;
         let validation = Validation::new(
             workers,
             tokenizer,
@@ -561,6 +635,7 @@ mod tests {
             max_top_n_tokens,
             max_input_length,
             max_total_tokens,
+            disable_grammar_support,
         );
         match validation
             .validate(GenerateRequest {
@@ -616,6 +691,7 @@ mod tests {
         let max_input_length = 5;
         let max_total_tokens = 106;
         let workers = 1;
+        let disable_grammar_support = true;
         let validation = Validation::new(
             workers,
             tokenizer,
@@ -624,6 +700,7 @@ mod tests {
             max_top_n_tokens,
             max_input_length,
             max_total_tokens,
+            disable_grammar_support,
         );
         match validation
             .validate(GenerateRequest {
