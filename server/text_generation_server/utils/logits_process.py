@@ -6,7 +6,7 @@ from typing import Dict, Union
 from text_generation_server.pb.generate_pb2 import GrammarType
 
 from outlines.fsm.fsm import RegexFSM
-from outlines.fsm.json_schema import build_regex_from_object
+from outlines.fsm.json_schema import build_regex_from_schema
 from functools import lru_cache
 from typing import List, Optional, DefaultDict
 import time
@@ -143,6 +143,8 @@ class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
         score = torch.gather(scores, 1, input_ids)
         # if score < 0 then penalty has to be multiplied to reduce the previous token probability
         score = -torch.where(score < 0, score * self.penalty, score / self.penalty)
+        # set score to 0 where input_ids is a padding token
+        score *= input_ids.ne(0)
 
         return scores.scatter_add_(1, input_ids, score)
 
@@ -168,6 +170,8 @@ class HeterogeneousFrequencyPenaltyLogitsProcessor(LogitsProcessor):
         score = -torch.where(
             score < 0, score * self.penalty_tensor, score / self.penalty_tensor
         )
+        # set score to 0 where input_ids is a padding token
+        score *= input_ids.ne(0)
 
         return scores.scatter_add_(1, input_ids, score)
 
@@ -512,7 +516,7 @@ class GrammarLogitProcessor(LogitsProcessor):
     def _cached_compile_fsm(grammar_type, schema, tokenizer):
         start_time = time.time()
         if grammar_type == GrammarType.GRAMMAR_TYPE_JSON:
-            schema = build_regex_from_object(schema)
+            schema = build_regex_from_schema(schema)
         elif grammar_type == GrammarType.GRAMMAR_TYPE_REGEX:
             pass  # schema is already a regex just here for clarity
         fsm = RegexFSM(schema, tokenizer)
@@ -555,6 +559,9 @@ class HeterogeneousGrammarLogitProcessor(LogitsProcessor):
         self.tokenizer = GrammarLogitProcessor._cached_adapt_tokenizer(tokenizer)
         self.fsms = []
         for grammar, grammar_type in zip(grammars, grammar_types):
+            if len(grammar) == 0:
+                self.fsms.append(None)
+                continue
             fsm = GrammarLogitProcessor._cached_compile_fsm(
                 grammar_type, grammar, self.tokenizer
             )
@@ -572,7 +579,7 @@ class HeterogeneousGrammarLogitProcessor(LogitsProcessor):
                 continue
             allowed_tokens = fsm.allowed_token_ids(fsm_grammar_states[i])
             mask[i, allowed_tokens] = 0
-        logits += mask
+            logits[i] += mask[i]
         return logits
 
     def advance_batch(self, next_token_ids, fsm_grammar_states):
@@ -584,6 +591,8 @@ class HeterogeneousGrammarLogitProcessor(LogitsProcessor):
         ]
 
     def advance_at_index(self, next_token_id, fsm_grammar_state, index):
+        if self.fsms[index] is None:
+            return fsm_grammar_state
         return GrammarLogitProcessor._advance(
             next_token_id, fsm_grammar_state, self.fsms[index]
         )

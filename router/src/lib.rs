@@ -1,3 +1,4 @@
+pub mod config;
 mod health;
 /// Text Generation Inference Webserver
 mod infer;
@@ -48,9 +49,22 @@ pub struct HubModelInfo {
     pub pipeline_tag: Option<String>,
 }
 
-#[derive(Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ChatTemplate {
+    name: String,
+    template: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ChatTemplateVersions {
+    Single(String),
+    Multiple(Vec<ChatTemplate>),
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct HubTokenizerConfig {
-    pub chat_template: Option<String>,
+    pub chat_template: Option<ChatTemplateVersions>,
     pub completion_template: Option<String>,
     #[serde(deserialize_with = "token_serde::deserialize")]
     pub bos_token: Option<String>,
@@ -59,13 +73,13 @@ pub struct HubTokenizerConfig {
 }
 
 impl HubTokenizerConfig {
-    pub fn from_file(filename: &std::path::Path) -> Self {
-        let content = std::fs::read_to_string(filename).unwrap();
-        serde_json::from_str(&content).unwrap_or_default()
+    pub fn from_file<P: AsRef<std::path::Path>>(filename: P) -> Option<Self> {
+        let content = std::fs::read_to_string(filename).ok()?;
+        serde_json::from_str(&content).ok()
     }
 }
 
-#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, ToSchema, Serialize)]
 #[serde(tag = "type", content = "value")]
 pub(crate) enum GrammarType {
     /// A string that represents a [JSON Schema](https://json-schema.org/).
@@ -102,6 +116,7 @@ mod token_serde {
                     ))
                 }
             }
+            Value::Null => Ok(None),
             _ => Err(de::Error::custom("invalid token format")),
         }
     }
@@ -141,6 +156,8 @@ pub struct Info {
     pub max_batch_size: Option<usize>,
     #[schema(example = "2")]
     pub validation_workers: usize,
+    #[schema(example = "32")]
+    pub max_client_batch_size: usize,
     /// Router Info
     #[schema(example = "0.5.0")]
     pub version: &'static str,
@@ -152,9 +169,12 @@ pub struct Info {
 
 #[derive(Clone, Debug, Deserialize, ToSchema, Default)]
 pub(crate) struct GenerateParameters {
+    /// Generate best_of sequences and return the one if the highest token logprobs.
     #[serde(default)]
     #[schema(exclusive_minimum = 0, nullable = true, default = "null", example = 1)]
     pub best_of: Option<usize>,
+
+    /// The value used to module the logits distribution.
     #[serde(default)]
     #[schema(
         exclusive_minimum = 0.0,
@@ -163,6 +183,9 @@ pub(crate) struct GenerateParameters {
         example = 0.5
     )]
     pub temperature: Option<f32>,
+
+    /// The parameter for repetition penalty. 1.0 means no penalty.
+    /// See [this paper](https://arxiv.org/pdf/1909.05858.pdf) for more details.
     #[serde(default)]
     #[schema(
         exclusive_minimum = 0.0,
@@ -171,6 +194,10 @@ pub(crate) struct GenerateParameters {
         example = 1.03
     )]
     pub repetition_penalty: Option<f32>,
+
+    /// The parameter for frequency penalty. 1.0 means no penalty
+    /// Penalize new tokens based on their existing frequency in the text so far,
+    /// decreasing the model's likelihood to repeat the same line verbatim.
     #[serde(default)]
     #[schema(
         exclusive_minimum = -2.0,
@@ -179,9 +206,13 @@ pub(crate) struct GenerateParameters {
         example = 0.1
     )]
     pub frequency_penalty: Option<f32>,
+
+    /// The number of highest probability vocabulary tokens to keep for top-k-filtering.
     #[serde(default)]
     #[schema(exclusive_minimum = 0, nullable = true, default = "null", example = 10)]
     pub top_k: Option<i32>,
+
+    /// Top-p value for nucleus sampling.
     #[serde(default)]
     #[schema(
         exclusive_minimum = 0.0,
@@ -191,6 +222,9 @@ pub(crate) struct GenerateParameters {
         example = 0.95
     )]
     pub top_p: Option<f32>,
+
+    /// Typical Decoding mass
+    /// See [Typical Decoding for Natural Language Generation](https://arxiv.org/abs/2202.00666) for more information.
     #[serde(default)]
     #[schema(
         exclusive_minimum = 0.0,
@@ -200,30 +234,48 @@ pub(crate) struct GenerateParameters {
         example = 0.95
     )]
     pub typical_p: Option<f32>,
+
+    /// Activate logits sampling.
     #[serde(default)]
     #[schema(default = "false", example = true)]
     pub do_sample: bool,
+
+    /// Maximum number of tokens to generate.
     #[serde(default = "default_max_new_tokens")]
     #[schema(nullable = true, default = "100", example = "20")]
     pub max_new_tokens: Option<u32>,
+
+    /// Whether to prepend the prompt to the generated text
     #[serde(default)]
     #[schema(nullable = true, default = "null", example = false)]
     pub return_full_text: Option<bool>,
+
+    /// Stop generating tokens if a member of `stop` is generated.
     #[serde(default)]
     #[schema(inline, max_items = 4, example = json ! (["photographer"]))]
     pub stop: Vec<String>,
+
+    /// Truncate inputs tokens to the given size.
     #[serde(default)]
     #[schema(nullable = true, default = "null", example = "null")]
     pub truncate: Option<usize>,
+
+    /// Watermarking with [A Watermark for Large Language Models](https://arxiv.org/abs/2301.10226).
     #[serde(default)]
     #[schema(default = "false", example = true)]
     pub watermark: bool,
+
+    /// Whether to return generation details.
     #[serde(default)]
     #[schema(default = "true")]
     pub details: bool,
+
+    /// Whether to return decoder input token logprobs and ids.
     #[serde(default)]
-    #[schema(default = "true")]
+    #[schema(default = "false")]
     pub decoder_input_details: bool,
+
+    /// Random sampling seed.
     #[serde(default)]
     #[schema(
         exclusive_minimum = 0,
@@ -232,10 +284,15 @@ pub(crate) struct GenerateParameters {
         example = "null"
     )]
     pub seed: Option<u64>,
+
+    /// The number of highest probability vocabulary tokens to keep for top-n-filtering.
     #[serde(default)]
     #[schema(exclusive_minimum = 0, nullable = true, default = "null", example = 5)]
     pub top_n_tokens: Option<u32>,
+
+    /// Grammar constraints for the generation.
     #[serde(default)]
+    #[schema(nullable = true, default = "null", example = "null")]
     pub grammar: Option<GrammarType>,
 }
 
@@ -266,6 +323,34 @@ fn default_parameters() -> GenerateParameters {
     }
 }
 
+mod prompt_serde {
+    use serde::{self, Deserialize, Deserializer};
+    use serde_json::Value;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(s) => Ok(vec![s]),
+            Value::Array(arr) if arr.is_empty() => Err(serde::de::Error::custom(
+                "Empty array detected. Do not use an empty array for the prompt.",
+            )),
+            Value::Array(arr) => arr
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => Ok(s.to_owned()),
+                    _ => Err(serde::de::Error::custom("Expected a string")),
+                })
+                .collect(),
+            _ => Err(serde::de::Error::custom(
+                "Expected a string or an array of strings",
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize, ToSchema, Debug)]
 pub struct CompletionRequest {
     /// UNUSED
@@ -275,7 +360,8 @@ pub struct CompletionRequest {
 
     /// The prompt to generate completions for.
     #[schema(example = "What is Deep Learning?")]
-    pub prompt: String,
+    #[serde(deserialize_with = "prompt_serde::deserialize")]
+    pub prompt: Vec<String>,
 
     /// The maximum number of tokens that can be generated in the chat completion.
     #[serde(default)]
@@ -385,23 +471,33 @@ impl From<(Token, Vec<Token>)> for ChatCompletionLogprobs {
 impl From<(Vec<Token>, Vec<Vec<Token>>)> for ChatCompletionLogprobs {
     fn from(value: (Vec<Token>, Vec<Vec<Token>>)) -> Self {
         let (tokens, top_tokens) = value;
-        Self {
-            content: tokens
-                .into_iter()
-                .zip(top_tokens)
-                .map(|(t, top_t)| ChatCompletionLogprob {
-                    token: t.text,
-                    logprob: t.logprob,
-                    top_logprobs: top_t
+
+        // Create an iterator that produces None for top_tokens once it's exhausted
+        let top_tokens_iter = top_tokens
+            .into_iter()
+            .map(Some)
+            .chain(std::iter::repeat(None));
+
+        let content = tokens
+            .into_iter()
+            .zip(top_tokens_iter)
+            .map(|(t, top_t_option)| ChatCompletionLogprob {
+                token: t.text,
+                logprob: t.logprob,
+                top_logprobs: match top_t_option {
+                    Some(top_t) => top_t
                         .into_iter()
                         .map(|t| ChatCompletionTopLogprob {
                             token: t.text,
                             logprob: t.logprob,
                         })
                         .collect(),
-                })
-                .collect(),
-        }
+                    None => vec![], // Handle the case where there are no top tokens
+                },
+            })
+            .collect();
+
+        Self { content }
     }
 }
 
@@ -433,7 +529,7 @@ impl ChatCompletion {
         created: u64,
         details: Details,
         return_logprobs: bool,
-        tool_calls: Option<ToolCall>,
+        tool_calls: Option<Vec<ToolCall>>,
     ) -> Self {
         Self {
             id: String::new(),
@@ -524,7 +620,6 @@ impl ChatCompletionChunk {
         delta: Option<String>,
         tool_calls: Option<Vec<String>>,
         created: u64,
-        index: u32,
         logprobs: Option<ChatCompletionLogprobs>,
         finish_reason: Option<String>,
     ) -> Self {
@@ -535,12 +630,12 @@ impl ChatCompletionChunk {
             model,
             system_fingerprint,
             choices: vec![ChatCompletionChoice {
-                index,
+                index: 0,
                 delta: ChatCompletionDelta {
                     role: "assistant".to_string(),
                     content: delta,
                     tool_calls: tool_calls.map(|tc| DeltaToolCall {
-                        index,
+                        index: 0,
                         id: String::new(),
                         r#type: "function".to_string(),
                         function: Function {
@@ -646,7 +741,7 @@ pub(crate) struct ChatRequest {
     #[serde(default = "default_tool_prompt")]
     #[schema(
         nullable = true,
-        example = "\"Based on the conversation, please choose the most appropriate tool to use: \""
+        example = "\"You will be presented with a JSON schema representing a set of tools.\nIf the user request lacks of sufficient information to make a precise tool selection: Do not invent any tool's properties, instead notify with an error message.\n\nJSON Schema:\n\""
     )]
     pub tool_prompt: Option<String>,
 
@@ -659,7 +754,7 @@ pub(crate) struct ChatRequest {
 
 fn default_tool_prompt() -> Option<String> {
     Some(
-        "\nBased on the conversation, please choose the most appropriate tool to use: ".to_string(),
+        "\nYou will be presented with a JSON schema representing a set of tools.\nIf the user request lacks of sufficient information to make a precise tool selection: Do not invent any tool's properties, instead notify with an error message.\n\nJSON Schema:\n".to_string(),
     )
 }
 #[derive(Clone, Deserialize, ToSchema, Serialize)]
@@ -704,26 +799,26 @@ mod deserialize_tool_choice {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize, ToSchema, PartialEq)]
 pub struct Tools {
     #[serde(flatten)]
     functions_map: FunctionsMap,
     properties: Properties,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct FunctionsMap {
     #[serde(rename = "$functions")]
     functions: std::collections::HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct FunctionRef {
     #[serde(rename = "$ref")]
     ref_path: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct Properties {
     #[serde(serialize_with = "serialize_function")]
     function: Vec<FunctionRef>,
@@ -744,7 +839,8 @@ pub(crate) struct FunctionDefinition {
     #[serde(default)]
     pub description: Option<String>,
     pub name: String,
-    pub parameters: serde_json::Value,
+    #[serde(alias = "parameters")]
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -756,12 +852,14 @@ pub(crate) struct Tool {
     pub function: FunctionDefinition,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub(crate) struct ChatTemplateInputs<'a> {
     messages: Vec<Message>,
     bos_token: Option<&'a str>,
     eos_token: Option<&'a str>,
     add_generation_prompt: bool,
+    tools: Option<&'a str>,
+    tools_prompt: Option<&'a str>,
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema, Default, Debug)]
@@ -782,7 +880,7 @@ pub(crate) struct Message {
     #[schema(example = "\"David\"")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<ToolCall>,
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -968,7 +1066,10 @@ mod tests {
         let config: HubTokenizerConfig = serde_json::from_str(json_content).unwrap();
 
         // check that we successfully parsed the tokens
-        assert_eq!(config.chat_template, Some("test".to_string()));
+        assert_eq!(
+            config.chat_template,
+            Some(ChatTemplateVersions::Single("test".to_string()))
+        );
         assert_eq!(
             config.bos_token,
             Some("<｜begin▁of▁sentence｜>".to_string())
@@ -1000,7 +1101,10 @@ mod tests {
         let config: HubTokenizerConfig = serde_json::from_str(json_content).unwrap();
 
         // check that we successfully parsed the tokens
-        assert_eq!(config.chat_template, Some("test".to_string()));
+        assert_eq!(
+            config.chat_template,
+            Some(ChatTemplateVersions::Single("test".to_string()))
+        );
         assert_eq!(
             config.bos_token,
             Some("<｜begin▁of▁sentence｜>".to_string())

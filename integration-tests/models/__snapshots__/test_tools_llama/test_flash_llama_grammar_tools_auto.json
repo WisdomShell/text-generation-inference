@@ -8,31 +8,32 @@
         "content": null,
         "name": null,
         "role": "assistant",
-        "tool_calls": {
-          "function": {
-            "description": null,
-            "name": "tools",
-            "parameters": {
-              "format": "celsius",
-              "location": "New York, NY",
-              "num_days": 14
-            }
-          },
-          "id": 0,
-          "type": "function"
-        }
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": {
+                "format": "celsius",
+                "location": "Brooklyn"
+              },
+              "description": null,
+              "name": "get_current_weather"
+            },
+            "id": 0,
+            "type": "function"
+          }
+        ]
       },
       "usage": null
     }
   ],
-  "created": 1709079492,
+  "created": 1712787937,
   "id": "",
   "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
   "object": "text_completion",
-  "system_fingerprint": "1.4.3-native",
+  "system_fingerprint": "2.0.1-native",
   "usage": {
-    "completion_tokens": 29,
-    "prompt_tokens": 316,
-    "total_tokens": 345
+    "completion_tokens": 37,
+    "prompt_tokens": 524,
+    "total_tokens": 561
   }
 }

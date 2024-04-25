@@ -3,10 +3,10 @@ import torch.distributed
 
 from opentelemetry import trace
 from typing import Optional
+from transformers.models.gemma import GemmaTokenizerFast
 
 from text_generation_server.models import FlashCausalLM
 from text_generation_server.models.custom_modeling.flash_gemma_modeling import (
-    GemmaTokenizerFast,
     FlashGemmaForCausalLM,
     GemmaConfig,
 )

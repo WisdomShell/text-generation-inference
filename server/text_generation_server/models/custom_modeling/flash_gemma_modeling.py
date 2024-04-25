@@ -20,16 +20,11 @@
 
 import torch
 import torch.distributed
-import os
-from shutil import copyfile
 
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from typing import Optional, List, Tuple
-from tokenizers import processors
-from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
-from transformers.utils import logging
 
 from text_generation_server.utils import paged_attention, flash_attn
 from text_generation_server.utils.layers import (
@@ -42,162 +37,6 @@ from text_generation_server.utils.layers import (
     FastRMSNorm,
 )
 
-GemmaTokenizer = None
-
-logger = logging.get_logger(__name__)
-VOCAB_FILES_NAMES = {
-    "vocab_file": "tokenizer.model",
-    "tokenizer_file": "tokenizer.json",
-}
-
-PRETRAINED_VOCAB_FILES_MAP = {
-    "vocab_file": {
-        "hf-internal-testing/llama-tokenizer": "https://huggingface.co/hf-internal-testing/llama-tokenizer/resolve/main/tokenizer.model",
-    },
-    "tokenizer_file": {
-        "hf-internal-testing/llama-tokenizer": "https://huggingface.co/hf-internal-testing/llama-tokenizer/resolve/main/tokenizer_config.json",
-    },
-}
-B_INST, E_INST = "[INST]", "[/INST]"
-B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
-
-# fmt: off
-DEFAULT_SYSTEM_PROMPT = """You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your \
-answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure\
- that your responses are socially unbiased and positive in nature.
-
-If a question does not make any sense, or is not factually coherent, explain why instead of answering something not \
-correct. If you don't know the answer to a question, please don't share false information."""
-# fmt: on
-
-
-class GemmaTokenizerFast(PreTrainedTokenizerFast):
-    vocab_files_names = VOCAB_FILES_NAMES
-    pretrained_vocab_files_map = PRETRAINED_VOCAB_FILES_MAP
-    slow_tokenizer_class = GemmaTokenizer
-    padding_side = "left"
-    model_input_names = ["input_ids", "attention_mask"]
-
-    def __init__(
-        self,
-        vocab_file=None,
-        tokenizer_file=None,
-        clean_up_tokenization_spaces=False,
-        unk_token="<unk>",
-        bos_token="<bos>",
-        eos_token="<eos>",
-        pad_token="<pad>",
-        add_bos_token=True,
-        add_eos_token=False,
-        use_default_system_prompt=False,
-        **kwargs,
-    ):
-        super().__init__(
-            vocab_file=vocab_file,
-            tokenizer_file=tokenizer_file,
-            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
-            unk_token=unk_token,
-            bos_token=bos_token,
-            eos_token=eos_token,
-            pad_token=pad_token,
-            add_bos_token=add_bos_token,
-            add_eos_token=add_eos_token,
-            use_default_system_prompt=use_default_system_prompt,
-            **kwargs,
-        )
-        self._add_bos_token = add_bos_token
-        self._add_eos_token = add_eos_token
-        self.update_post_processor()
-        self.use_default_system_prompt = use_default_system_prompt
-        self.vocab_file = vocab_file
-
-    @property
-    def can_save_slow_tokenizer(self) -> bool:
-        return os.path.isfile(self.vocab_file) if self.vocab_file else False
-
-    def update_post_processor(self):
-        """
-        Updates the underlying post processor with the current `bos_token` and `eos_token`.
-        """
-        bos = self.bos_token
-        bos_token_id = self.bos_token_id
-        if bos is None and self.add_bos_token:
-            raise ValueError("add_bos_token = True but bos_token = None")
-
-        eos = self.eos_token
-        eos_token_id = self.eos_token_id
-        if eos is None and self.add_eos_token:
-            raise ValueError("add_eos_token = True but eos_token = None")
-
-        single = f"{(bos+':0 ') if self.add_bos_token else ''}$A:0{(' '+eos+':0') if self.add_eos_token else ''}"
-        pair = f"{single}{(' '+bos+':1') if self.add_bos_token else ''} $B:1{(' '+eos+':1') if self.add_eos_token else ''}"
-
-        special_tokens = []
-        if self.add_bos_token:
-            special_tokens.append((bos, bos_token_id))
-        if self.add_eos_token:
-            special_tokens.append((eos, eos_token_id))
-        self._tokenizer.post_processor = processors.TemplateProcessing(
-            single=single, pair=pair, special_tokens=special_tokens
-        )
-
-    @property
-    def add_eos_token(self):
-        return self._add_eos_token
-
-    @property
-    def add_bos_token(self):
-        return self._add_bos_token
-
-    @add_eos_token.setter
-    def add_eos_token(self, value):
-        self._add_eos_token = value
-        self.update_post_processor()
-
-    @add_bos_token.setter
-    def add_bos_token(self, value):
-        self._add_bos_token = value
-        self.update_post_processor()
-
-    def save_vocabulary(
-        self, save_directory: str, filename_prefix: Optional[str] = None
-    ) -> Tuple[str]:
-        if not self.can_save_slow_tokenizer:
-            raise ValueError(
-                "Your fast tokenizer does not have the necessary information to save the vocabulary for a slow "
-                "tokenizer."
-            )
-
-        if not os.path.isdir(save_directory):
-            logger.error(f"Vocabulary path ({save_directory}) should be a directory")
-            return
-        out_vocab_file = os.path.join(
-            save_directory,
-            (filename_prefix + "-" if filename_prefix else "")
-            + VOCAB_FILES_NAMES["vocab_file"],
-        )
-
-        if os.path.abspath(self.vocab_file) != os.path.abspath(out_vocab_file):
-            copyfile(self.vocab_file, out_vocab_file)
-
-        return (out_vocab_file,)
-
-    @property
-    def default_chat_template(self):
-        raise NotImplementedError
-
-    # TODO ArthurZ let's rely on the template processor instead, refactor all fast tokenizers
-    def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
-        bos_token_id = [self.bos_token_id] if self.add_bos_token else []
-        eos_token_id = [self.eos_token_id] if self.add_eos_token else []
-
-        output = bos_token_id + token_ids_0 + eos_token_id
-
-        if token_ids_1 is not None:
-            output = output + bos_token_id + token_ids_1 + eos_token_id
-
-        return output
-
 
 class GemmaConfig(PretrainedConfig):
     def __init__(
@@ -209,7 +48,7 @@ class GemmaConfig(PretrainedConfig):
         num_attention_heads=16,
         num_key_value_heads=16,
         head_dim=256,
-        hidden_act="gelu",
+        hidden_act="gelu_pytorch_tanh",
         max_position_embeddings=8192,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
@@ -260,6 +99,17 @@ class GemmaFastRMSNorm(FastRMSNorm):
     def load(cls, prefix, weights, eps=1e-6):
         weight = weights.get_tensor(f"{prefix}.weight") + 1
         return cls(weight, eps)
+
+    # perform the multiplication in full precision and downcast after
+    def forward(self, hidden_states, residual=None):
+        if residual is not None:
+            hidden_states += residual
+        residual = hidden_states
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = hidden_states * self.weight
+        return hidden_states.to(self.weight.dtype), residual
 
 
 def load_attention(config, prefix, weights):

@@ -28,7 +28,7 @@ from text_generation_server.models.cache_manager import (
     BLOCK_SIZE,
 )
 from text_generation_server.pb import generate_pb2
-from text_generation_server.models.globals import MEM_POOL, ENABLE_CUDA_GRAPHS
+from text_generation_server.models.globals import MEM_POOL, CUDA_GRAPHS
 from text_generation_server.utils import StoppingCriteria, HeterogeneousNextTokenChooser
 from text_generation_server.utils.dist import MEMORY_FRACTION
 
@@ -107,6 +107,19 @@ class FlashCausalLMBatch(Batch):
         )
 
     @classmethod
+    def batch_tokenized_inputs(cls, requests, tokenizer):
+        batch_inputs = []
+        max_truncation = 0
+        for r in requests:
+            batch_inputs.append(r.inputs)
+            max_truncation = max(max_truncation, r.truncate)
+
+        batch_tokenized_inputs = tokenizer(
+            batch_inputs, truncation=True, max_length=max_truncation
+        )["input_ids"]
+        return batch_tokenized_inputs
+
+    @classmethod
     def from_pb(
         cls,
         pb: generate_pb2.Batch,
@@ -114,16 +127,7 @@ class FlashCausalLMBatch(Batch):
         dtype: torch.dtype,
         device: torch.device,
     ) -> "FlashCausalLMBatch":
-        batch_inputs = []
-        max_truncation = 0
-        for r in pb.requests:
-            batch_inputs.append(r.inputs)
-            max_truncation = max(max_truncation, r.truncate)
-
-        batch_tokenized_inputs = tokenizer(
-            batch_inputs, truncation=True, max_length=max_truncation
-        )["input_ids"]
-
+        batch_tokenized_inputs = cls.batch_tokenized_inputs(pb.requests, tokenizer)
         position_ids = []
         speculative_ids = []
         cu_seqlen_prefill = [0]
@@ -165,6 +169,11 @@ class FlashCausalLMBatch(Batch):
             requests_idx_mapping[r.id] = i
 
             tokenized_input = tokenized_input[-r.truncate :]
+            if (
+                tokenized_input[0] == tokenizer.bos_token_id
+                and tokenized_input[1] == tokenizer.bos_token_id
+            ):
+                tokenized_input = tokenized_input[1:]
 
             input_length = len(tokenized_input)
             input_lengths.append(input_length)
@@ -690,7 +699,7 @@ class FlashCausalLM(Model):
     def cuda_graph_warmup(self, bs: int, max_s: int, max_bt: int):
         input_ids = torch.zeros(bs, dtype=torch.int64, device=self.device)
         position_ids = torch.zeros(bs, dtype=torch.int32, device=self.device)
-        slots = torch.arange(bs, dtype=torch.int32, device=self.device)
+        slots = torch.arange(bs, dtype=torch.int64, device=self.device)
         input_lengths = torch.ones(bs, dtype=torch.int32, device=self.device) * max_s
         block_tables = (
             torch.arange(max_bt, dtype=torch.int32, device=self.device)
@@ -798,15 +807,17 @@ class FlashCausalLM(Model):
             self.device,
         )
 
-        if ENABLE_CUDA_GRAPHS:
+        if CUDA_GRAPHS:
             try:
-                logger.info("Experimental support for Cuda Graphs is enabled")
+                logger.info(f"Cuda Graphs are enabled for sizes {CUDA_GRAPHS}")
                 # Warmup cuda graphs
-                for bs in [1, 2, 4] + [8 * i for i in range(8)]:
+                for bs in CUDA_GRAPHS:
                     if self.speculate is None or self.speculate + 1 <= bs:
                         self.cuda_graph_warmup(bs, max_s, max_bt)
-            except Exception:
+            except torch.cuda.OutOfMemoryError:
                 logger.exception(f"Decode cuda graph warmup failed")
+        else:
+            logger.info(f"Cuda Graphs are disabled (CUDA_GRAPHS={CUDA_GRAPHS}).")
 
         return int(num_blocks * BLOCK_SIZE)
 
@@ -865,22 +876,14 @@ class FlashCausalLM(Model):
             lm_head_indices = batch.prefill_head_indices
 
         bs = input_ids.shape[0]
-        padded_bs = bs
-        if bs == 3:
-            padded_bs = 4
-        elif 3 < bs <= 8:
-            padded_bs = 8
-        elif bs > 8:
-            padded_bs = (bs + 7) // 8 * 8
+        sorted_padded_bs = sorted([k for k in self.cuda_graphs.keys() if k >= bs])
+        if sorted_padded_bs:
+            # Get associated cuda graph
+            cuda_graph = self.cuda_graphs[sorted_padded_bs[0]]
+        else:
+            cuda_graph = None
 
-        # Try to find an associated cuda graph
-        cuda_graph = self.cuda_graphs.get(padded_bs, None)
-
-        if (
-            cu_seqlen_prefill is not None
-            or cuda_graph is None
-            or batch.speculative_ids is not None
-        ):
+        if cu_seqlen_prefill is not None or cuda_graph is None:
             return self.model.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
