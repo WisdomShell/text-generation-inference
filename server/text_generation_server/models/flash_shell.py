@@ -26,6 +26,7 @@ class FlashShell(FlashCausalLM):
         revision: Optional[str] = None,
         quantize: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
+        use_medusa: Optional[str] = None,
         trust_remote_code: bool = False,
     ):
         self.process_group, rank, world_size = initialize_torch_distributed()
@@ -55,6 +56,7 @@ class FlashShell(FlashCausalLM):
         config.quantize = quantize
         config.transpose = config.architectures[0].startswith("GPT2")
         config.device = device
+        config.use_medusa = use_medusa
 
         torch.distributed.barrier(group=self.process_group)
 

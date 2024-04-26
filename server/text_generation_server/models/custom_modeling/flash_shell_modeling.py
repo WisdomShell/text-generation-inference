@@ -35,6 +35,7 @@ from text_generation_server.utils.layers import (
     TensorParallelHead,
     get_linear,
     FastLayerNorm,
+    SpeculativeHead,
 )
 
 
@@ -432,7 +433,7 @@ class FlashShellForCausalLM(torch.nn.Module):
         super().__init__()
         self.config = config
         self.model = FlashShellModel(config, weights)
-        self.lm_head = TensorParallelHead.load(
+        self.lm_head = SpeculativeHead.load(
             config,
             prefix="transformer.wte",
             weights=weights,
@@ -462,5 +463,5 @@ class FlashShellForCausalLM(torch.nn.Module):
         )
         if lm_head_indices is not None:
             hidden_states = hidden_states[lm_head_indices]
-        logits = self.lm_head(hidden_states)
-        return logits
+        logits, speculative_logits = self.lm_head(hidden_states)
+        return logits, speculative_logits
